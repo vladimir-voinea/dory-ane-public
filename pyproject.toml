@@ -34,6 +34,12 @@ dev = [
     "pytest-cov>=4.1.0" # Test coverage
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs artifacts built outside the repo (reference dumps, weights)",
+]
+
 [tool.setuptools]
 packages = ["anemll"]
 
