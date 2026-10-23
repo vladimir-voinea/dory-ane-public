@@ -11,9 +11,12 @@ llama-perplexity writes for --kl-divergence-base (a "_logits_" dump) plus a
 sidecar <name>.kld.meta.json.  Two modes:
 
 exact
-    dory.recurrent_kv_cache_mode=per_loop (the default): every loop keeps its
-    own KV cache, so the result does not depend on batching and equals a full
-    recompute.
+    dory.recurrent_kv_cache_mode=per_loop (the default) decoded with the whole
+    context in ONE ubatch (-b n_ctx -ub n_ctx): every loop keeps its own KV
+    cache and a chunk is a single physical pass, so the result is a full
+    recompute.  -ub must equal n_ctx - below the 1024-token sliding window the
+    logits stop being batch-independent, so a dump built with -ub < n_ctx is not
+    a reference (see ubatch_for() in scripts/make_dory_references.py).
 decode
     dory.recurrent_kv_cache_mode=last_loop: one KV cache per recurrent layer,
     overwritten each loop, so the result depends on how the candidate batches

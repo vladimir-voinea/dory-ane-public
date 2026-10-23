@@ -50,24 +50,39 @@ Built with llama.cpp at PR #30306, BF16 GGUF, in the two modes the spec names:
 
 | name | mode | loops | batching | why |
 |---|---|---|---|---|
-| `bf16_exact_loop1.kld` | exact | 1 | `-b 4096 -ub 1024` | full recompute, loop budget 1 |
-| `bf16_exact_loop2.kld` | exact | 2 | `-b 4096 -ub 1024` | **the gate reference** |
-| `bf16_exact_loop4.kld` | exact | 4 | `-b 4096 -ub 1024` | full recompute, loop budget 4 |
+| `bf16_exact_loop1.kld` | exact | 1 | `-b 4096 -ub 4096` | full recompute, loop budget 1 |
+| `bf16_exact_loop2.kld` | exact | 2 | `-b 4096 -ub 4096` | **the gate reference** |
+| `bf16_exact_loop4.kld` | exact | 4 | `-b 4096 -ub 4096` | full recompute, loop budget 4 |
 | `bf16_decode_loop2_batch1.kld` | decode | 2 | `-b 1 -ub 1` | one token per step, as a decoder runs |
 | `bf16_decode_loop2_batch64.kld` | decode | 2 | `-b 64 -ub 64` | 64-token prefill batches |
 
-* **exact** = `dory.recurrent_kv_cache_mode=per_loop`: every loop keeps its own
-  KV cache, so the logits do not depend on how tokens are batched and equal a
-  full recompute. This is what the full-precision PyTorch port is scored against.
+* **exact** = `dory.recurrent_kv_cache_mode=per_loop` with **one ubatch per
+  context** (`-b 4096 -ub 4096`): every loop keeps its own KV cache and the
+  context is decoded in a single physical ubatch, so the logits are a full
+  recompute. This is what the full-precision PyTorch port is scored against.
 * **decode** = `dory.recurrent_kv_cache_mode=last_loop`: one KV cache per
   recurrent layer, overwritten each loop, so the result *does* depend on the
   batching the candidate actually uses. This is what a cached ANE or Core ML
   pipeline is scored against, at the batching it really runs.
 
+**The ubatch is not cosmetic.** Exact mode is batching-independent only when
+the whole context is one ubatch, because llama.cpp's 1024-token sliding window
+masks attention per ubatch. Measured on the BF16 GGUF, `per_loop`,
+`-c 4096 --chunks 1`, loops 1, PPL by `-ub`: 4.9790 at 64/256 (bit-identical to
+each other), 4.9610 at 512, 4.9623 at 1024, 4.9662 at 2048, 4.9655 at 4096. At
+loops 2, a `-ub 1024` dump scored against a `-ub 4096` dump reads mean KLD
+0.0076 / top-1 99.41 % / max 10.7 - the same order as every gate measured
+against this reference. Below a 1024-token context every ubatch setting is
+bit-identical, so the split only starts to matter exactly when the window
+begins masking. The ticket's first commit built the exact references with
+`-ub 1024`; they were regenerated at `-ub 4096` (one ubatch per context) and the
+sidecar now records `n_ubatch`. A reference built with `-ub < n_ctx` is not a
+full recompute and must not be used as a gate.
+
 Each artifact is the file `llama-perplexity --kl-divergence-base` writes
 (1.07 GB at this evaluation size) plus a `<name>.kld.meta.json` sidecar
-recording the exact command, loop count, KV mode, batch sizes, GGUF checksum,
-evaluation-set checksums, PPL and build time.
+recording the exact command, loop count, KV mode, batch and ubatch sizes, GGUF
+checksum, evaluation-set checksums, PPL and build time.
 
 Dump layout, so nobody has to reverse-engineer it again:
 
@@ -154,10 +169,10 @@ row counts or vocabulary sizes differ.
 
 | candidate | reference | rows | mean KLD | top-1 | PPL cand / ref |
 |---|---|---|---|---|---|
-| **Q8_0 GGUF, exact, 2 loops** | BF16 exact loop2 | 4094 | **0.000420 ± 0.000008** | **98.534 %** | 20.205 / 20.238 |
-| BF16 decode, 1 token per step | BF16 exact loop2 | 4094 | 0.006976 ± 0.000365 | 95.994 % | 19.864 / 20.238 |
-| BF16 decode, 64-token batches | BF16 exact loop2 | 4094 | 0.002853 ± 0.000108 | 97.533 % | 19.987 / 20.238 |
-| BF16 exact, loops 1 (context) | BF16 exact loop2 | 4094 | 0.016019 | 93.307 % | 20.729 / 20.238 |
+| **Q8_0 GGUF, exact, 2 loops** | BF16 exact loop2 | 4094 | **0.000423 ± 0.000008** | **98.461 %** | 20.204 / 20.238 |
+| BF16 decode, 1 token per step | BF16 exact loop2 | 4094 | 0.006975 ± 0.000363 | 96.116 % | 19.864 / 20.238 |
+| BF16 decode, 64-token batches | BF16 exact loop2 | 4094 | 0.002857 ± 0.000109 | 97.557 % | 19.987 / 20.238 |
+| BF16 exact, loops 1 (context) | BF16 exact loop2 | 4094 | 0.016054 | 93.087 % | 20.727 / 20.238 |
 
 Reference PPL on this set: **20.73 / 20.24 / 20.19** at 1 / 2 / 4 loops.
 Every artifact is 1,073,283,076 bytes (1.07 GB); the six of them plus the JSON
@@ -165,17 +180,22 @@ reports are 6.4 GB.
 
 **The last two rows are the floor for any `last_loop` candidate.** A cached model that
 runs `per_loop` is exact; one that runs `last_loop` cannot do better than the
-batching it uses: 0.0029 KLD / 97.5 % top-1 with 64-token prefill batches, 0.0070 /
-96.0 % with one token per step. On this text the caching penalty is 7-17x the Q8_0
+batching it uses: 0.0029 KLD / 97.6 % top-1 with 64-token prefill batches, 0.0070 /
+96.1 % with one token per step. On this text the caching penalty is 7-16x the Q8_0
 quantisation error, so DANE-4/DANE-5 should treat ~0.003-0.007 as their real
 headroom, not 0.
 
 **The scorer is verified against llama.cpp itself.** Scoring the Q8_0 candidate
-dump with `llama-perplexity --kl-divergence --kl-divergence-base bf16_exact_loop2.kld`
-prints `Mean KLD 0.000420 ± 0.000008`, `Maximum KLD 0.012116`, `99.0% KLD 0.001976`,
-median 0.000333, `Same top p 98.534 %` - identical to the scorer's output to six
-decimals. The plumbing check (BF16 scored against its own dump) gives 100.000 %
-top-1 and a maximum KLD of 6.4e-5, which is the reference's own 16-bit rounding.
+dump with `llama-perplexity --kl-divergence -b 4096 -ub 4096 --kl-divergence-base
+bf16_exact_loop2.kld` prints `Mean KLD 0.000423 ± 0.000008`, `Maximum KLD
+0.012146`, `99.0% KLD 0.001962`, median 0.000332, `Same top p 98.461 %` - the
+mean, the top-1 and the PPLs are identical to the scorer's output; the tail
+differs in the fifth digit only because llama.cpp scores raw float logits while
+the scorer re-reads the candidate's 16-bit dump. Pass `-b 4096 -ub 4096` exactly
+as the reference did: a candidate GGUF decoded with a smaller ubatch is a
+different computation, and the difference shows up as ~0.008 KLD. The plumbing
+check (BF16 scored against its own dump) gives 100.000 % top-1 and a maximum KLD
+of 6.4e-5, which is the reference's own 16-bit rounding.
 
 ### Why Q8_0 reads 0.00042 here and 0.00297 in the published table
 
@@ -188,9 +208,15 @@ transcript (`<|im_start|>` / `<|im_end|>` turns, reasoning off):
 
 | text | reference PPL | Q8_0 mean KLD | Q8_0 top-1 |
 |---|---|---|---|
-| prose, 2 x 4096 (this set) | 20.24 | 0.000420 | 98.534 % |
-| chat-templated, 2 x 4096 | 11.69 | 0.013124 | 98.046 % |
+| prose, 2 x 4096 (this set) | 20.24 | 0.000423 | 98.461 % |
+| chat-templated, 2 x 4096 * | 11.69 | 0.013124 | 98.046 % |
 | published (unavailable text) | 2.28 | 0.002972 | 98.852 % |
+
+\* measured against the ticket's first exact reference, built with `-ub 1024`
+before the one-ubatch ruling, and not re-run when the reference was regenerated
+(that templated text was a scratch experiment and is not committed). Treat the
+row as indicative: the split-ubatch reference is itself worth ~0.008 KLD, which
+is why only the prose row above is measured against the current artifacts.
 
 So the published value sits between the two texts we can build, and the top-1
 agreement (98.5 % / 98.0 % / 98.85 %) barely moves. The prose set is the one

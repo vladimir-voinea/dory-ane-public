@@ -56,7 +56,14 @@ def test_exact_reference_is_the_documented_artifact(name, loops):
     assert meta["chunk_size"] == 4096
     assert meta["n_chunks"] == 2
     assert meta["n_rows"] == load_eval_set(FIXTURE_DIR).n_rows
-    assert "recurrent_kv_cache_mode=str:per_loop" in " ".join(meta["tool"]["command"])
+    # One ubatch covering the whole context: a context split into ubatches is
+    # not a full recompute once the 1024-token sliding window is active, so
+    # -ub 1024 (the ticket's first build) must never come back.
+    assert meta["n_batch"] == meta["chunk_size"]
+    assert meta["n_ubatch"] == meta["chunk_size"]
+    command = meta["tool"]["command"]
+    assert command[command.index("-ub") + 1] == str(meta["chunk_size"])
+    assert "recurrent_kv_cache_mode=str:per_loop" in " ".join(command)
 
 
 @pytest.mark.parametrize("name,batch", sorted(DECODE.items()))
@@ -88,7 +95,8 @@ def test_q8_0_exact_loop2_lands_near_the_published_figures():
     if not candidate.is_file():
         pytest.skip(f"{candidate} not built")
     result = score_files(reference, candidate)
-    # Measured here: 0.000420 mean KLD / 98.534% top-1. The published Q8_0
+    # Measured here: 0.000423 mean KLD / 98.461% top-1 against the -ub 4096
+    # reference. The published Q8_0
     # figures are 0.002972 / 98.852% on 32k positions of NVIDIA post-training
     # data; on this prose set the quantisation error shows up smaller because
     # the reference distributions are much flatter (see docs/dory-eval.md).
@@ -98,8 +106,8 @@ def test_q8_0_exact_loop2_lands_near_the_published_figures():
 
 
 def test_decode_mode_gap_is_the_last_loop_floor():
-    # measured on this set: one token per step 0.006976 KLD / 95.994% top-1,
-    # 64-token batches 0.002853 / 97.533%.  That is the floor a last_loop
+    # measured on this set: one token per step 0.006975 KLD / 96.116% top-1,
+    # 64-token batches 0.002857 / 97.557%.  That is the floor a last_loop
     # candidate can reach - it cannot beat the batching it runs.
     reference = ARTIFACTS / "bf16_exact_loop2.kld"
     if not reference.is_file():
