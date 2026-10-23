@@ -50,6 +50,7 @@ DEFAULT_EVAL_DIR = "/Users/vladimir/dev/dory-ane-artifacts/DANE-3"
 
 WEIGHTS = os.environ.get("DORY_WEIGHTS", DEFAULT_WEIGHTS)
 EVAL_DIR = os.environ.get("DORY_EVAL_DIR", DEFAULT_EVAL_DIR)
+REF_DIR = os.environ.get("DORY_REF_DIR", "/Users/vladimir/dev/dory-ane-artifacts/refs")
 
 # Gates from the ticket (spec.md, Testing Decisions).
 MIN_TOP1 = 99.0
@@ -374,31 +375,71 @@ def test_single_token_logits_are_almost_loop_count_invariant():
             print('    single-token max dlogp vs %d loops: %.4f' % (loops, float((base - other).abs().max())))
 
 
+def candidate_logprobs(model, eval_set, loops: int):
+    """Per-position log-probabilities for DANE-2's evaluation set.
+
+    Each context is a fresh forward with positions restarting at 0, which is how
+    the reference chunks are scored.
+    """
+    import numpy as np
+
+    logprobs = np.empty((eval_set.n_rows, model.config.vocab_size), dtype=np.float32)
+    with torch.inference_mode():
+        for chunk in range(eval_set.n_chunks):
+            start = chunk * eval_set.chunk_size
+            ids = torch.as_tensor(
+                eval_set.token_ids[start:start + eval_set.chunk_size], dtype=torch.long
+            )
+            local = np.arange(eval_set.first_scored, eval_set.chunk_size - 1)
+            logits = model(ids, loop_count=loops, positions=local)[0]
+            logprobs[chunk * eval_set.rows_per_chunk:(chunk + 1) * eval_set.rows_per_chunk] = (
+                torch.log_softmax(logits.float(), dim=-1).numpy()
+            )
+            del logits
+    return logprobs
+
+
 def test_exact_mode_scores_at_every_loop_count():
-    """Top-1 >= 99% and mean KLD <= 0.005 against llama.cpp per_loop (exact mode)."""
-    scorer = reference_scorer()
-    if scorer is None:
-        _skip("reference scorer from DANE-2 (anemll/eval) is not on this branch yet")
+    """Top-1 >= 99% and mean KLD <= 0.005 against llama.cpp per_loop (exact mode).
+
+    The reference is per_loop with ONE ubatch covering the whole 4096-token
+    context: any split ubatch makes llama.cpp batch-dependent (measured: at
+    ctx 4096, -ub 1024 differs from -ub 4096 by mean KLD 0.0076), so only the
+    single-ubatch run is a full recompute to compare a recompute against.
+    """
+    import numpy as np
+    from anemll.eval import kld as kld_module
+    from anemll.eval.eval_set import load_eval_set
+
+    eval_set = load_eval_set()
     model = loaded_model()
     for loops in (1, 2, 4):
-        path = reference_path(loops)
-        if path is None:
-            _skip("no reference logits for %d loops (set DORY_EVAL_DIR)" % loops)
-        ref = scorer.read_kld(path)
-        positions = ref["positions"]
-        tokens = ref["tokens"]
-        with torch.inference_mode():
-            logits = model(torch.as_tensor(tokens, dtype=torch.long), loop_count=loops, positions=positions)[0]
-            logprobs = torch.log_softmax(logits.float(), dim=-1).numpy()
-        candidate = dict(logprobs=logprobs, tokens=tokens, positions=positions)
-        result = scorer.score(ref, candidate)
-        report = scorer.report(ref, result)
-        print(
-            "loops=%d positions=%d mean KLD %.6f top1 %.2f%% (gate: KLD <= %.3f, top1 >= %.1f%%)"
-            % (loops, report["positions"], report["mean_kld"], report["top1_pct"], MAX_KLD, MIN_TOP1)
+        path = os.path.join(REF_DIR, "bf16_exact_loop%d.kld" % loops)
+        if not os.path.isfile(path):
+            _skip("no exact reference %s (set DORY_REF_DIR)" % path)
+        reference = kld_module.read_llama_cpp_kld(path)
+        logprobs = candidate_logprobs(model, eval_set, loops)
+        candidate = kld_module.array_source(
+            logprobs, tokens=eval_set.token_ids, positions=eval_set.scored_positions(),
+            name="dory-fp32-loop%d" % loops,
         )
-        assert report["top1_pct"] >= MIN_TOP1, report
-        assert report["mean_kld"] <= MAX_KLD, report
+        result = kld_module.score_sources(reference, candidate)
+        print(result.summary())
+        # Diagnosis: where the remaining difference sits, by row and by bucket.
+        ref_rows = reference.logp_block(0, reference.n_rows)
+        matches = np.argmax(ref_rows, axis=1) == np.argmax(logprobs, axis=1)
+        positions = eval_set.scored_positions()
+        edges = np.linspace(positions.min(), positions.max() + 1, 7).astype(int)
+        buckets = []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            sel = (positions >= lo) & (positions < hi)
+            if sel.any():
+                buckets.append("%d-%d %s" % (lo, hi - 1, "ok" if matches[sel].all() else
+                                             "%.4f" % (1.0 - matches[sel].mean())))
+        print("  top-1 by position bucket: " + "  ".join(buckets))
+        del ref_rows, logprobs, candidate
+        assert 100.0 * result.top1_agreement >= MIN_TOP1, result.summary()
+        assert result.mean_kld <= MAX_KLD, result.summary()
 
 
 def test_greedy_generation_matches_llama_cpp():
@@ -414,11 +455,20 @@ def test_greedy_generation_matches_llama_cpp():
         expected = json.load(handle)
     tokenizer = AutoTokenizer.from_pretrained(WEIGHTS)
     prompt_ids = expected["prompt_tokens"]
-    assert tokenizer.decode(prompt_ids)
+    # same prompt tokens on both sides, else the comparison is meaningless
+    assert tokenizer.decode(prompt_ids) == expected["prompt_text"]
+    assert expected.get("llamacpp_prompt_tokens") in (None, len(prompt_ids)), (
+        "llama.cpp tokenized the prompt into %s tokens, we have %d"
+        % (expected.get("llamacpp_prompt_tokens"), len(prompt_ids))
+    )
     model = loaded_model()
     with torch.inference_mode():
         got = model.greedy_generate(torch.tensor(prompt_ids), max_new_tokens=32, loop_count=2)
-    assert got == expected["tokens"], "greedy mismatch:\n got %s\n want %s" % (got, expected["tokens"])
+    print("    llama.cpp : %s" % expected["greedy_tokens"])
+    print("    our model : %s" % got)
+    assert got == expected["greedy_tokens"], (
+        "greedy mismatch:\n got %s\n want %s" % (got, expected["greedy_tokens"])
+    )
 
 
 def main():
