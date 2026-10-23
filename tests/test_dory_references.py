@@ -34,9 +34,14 @@ EXACT = {
     "bf16_exact_loop2": 2,
     "bf16_exact_loop4": 4,
 }
+# name -> (loops, n_batch): decode references exist at every reported loop count
 DECODE = {
-    "bf16_decode_loop2_batch1": 1,
-    "bf16_decode_loop2_batch64": 64,
+    "bf16_decode_loop1_batch1": (1, 1),
+    "bf16_decode_loop1_batch64": (1, 64),
+    "bf16_decode_loop2_batch1": (2, 1),
+    "bf16_decode_loop2_batch64": (2, 64),
+    "bf16_decode_loop4_batch1": (4, 1),
+    "bf16_decode_loop4_batch64": (4, 64),
 }
 
 
@@ -66,11 +71,14 @@ def test_exact_reference_is_the_documented_artifact(name, loops):
     assert "recurrent_kv_cache_mode=str:per_loop" in " ".join(command)
 
 
-@pytest.mark.parametrize("name,batch", sorted(DECODE.items()))
-def test_decode_reference_is_the_documented_artifact(name, batch):
+@pytest.mark.parametrize(
+    "name,loops,batch", sorted((n, loops, batch) for n, (loops, batch) in DECODE.items())
+)
+def test_decode_reference_is_the_documented_artifact(name, loops, batch):
     meta = _meta(name)
     assert meta["mode"] == "decode"
     assert meta["kv_cache_mode"] == "last_loop"
+    assert meta["loops"] == loops
     assert meta["n_batch"] == batch
     assert meta["n_ubatch"] == batch
     assert "recurrent_kv_cache_mode=str:last_loop" in " ".join(meta["tool"]["command"])
@@ -106,18 +114,23 @@ def test_q8_0_exact_loop2_lands_near_the_published_figures():
 
 
 def test_decode_mode_gap_is_the_last_loop_floor():
-    # measured on this set: one token per step 0.006975 KLD / 96.116% top-1,
-    # 64-token batches 0.002857 / 97.557%.  That is the floor a last_loop
-    # candidate can reach - it cannot beat the batching it runs.
-    reference = ARTIFACTS / "bf16_exact_loop2.kld"
-    if not reference.is_file():
-        pytest.skip(f"{reference} not built")
+    # Each decode reference is scored against the exact reference with the SAME
+    # loop count: that is the floor a last_loop candidate can reach, because it
+    # cannot beat the batching it runs.  At loop 2 on this set: one token per
+    # step 0.006975 KLD / 96.116% top-1, 64-token batches 0.002857 / 97.557%.
+    missing = [
+        name
+        for name, (loops, _batch) in DECODE.items()
+        if not (ARTIFACTS / f"{name}.kld").is_file()
+        or not (ARTIFACTS / f"bf16_exact_loop{loops}.kld").is_file()
+    ]
+    if missing:
+        pytest.skip(f"not built: {', '.join(sorted(missing))}")
     gaps = {}
-    for name in DECODE:
-        path = ARTIFACTS / f"{name}.kld"
-        if not path.is_file():
-            pytest.skip(f"{path} not built")
-        result = score_files(reference, path)
+    for name, (loops, _batch) in DECODE.items():
+        result = score_files(
+            ARTIFACTS / f"bf16_exact_loop{loops}.kld", ARTIFACTS / f"{name}.kld"
+        )
         gaps[name] = result.mean_kld
         assert result.mean_kld < 0.02, f"{name}: {result.summary()}"
         assert result.top1_agreement > 0.95, f"{name}: {result.summary()}"
