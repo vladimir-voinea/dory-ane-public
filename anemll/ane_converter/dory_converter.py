@@ -758,7 +758,10 @@ class DoryConverter(BaseConverter):
         dtype = self.config.dtype
         hidden = torch.zeros(1, seq, self.config.hidden_size, dtype=dtype)
         if spec.kind == "embeddings":
-            return (torch.zeros(1, seq, dtype=torch.int64),)
+            # int32 end to end: torch's embedding accepts it (checked) and the
+            # Core ML input is declared int32, so there is no dtype cast to get
+            # wrong between the trace and the converted graph.
+            return (torch.zeros(1, seq, dtype=torch.int32),)
         if spec.kind == "lm_head":
             return (hidden,)
         mask = torch.zeros(1, 1, seq, self.config.mask_len, dtype=dtype)
