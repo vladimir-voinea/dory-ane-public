@@ -171,3 +171,280 @@ def test_mask_input_is_the_concatenation():
     assert m.shape == (1, 1, 2, ctx + rows)
     assert torch.equal(m[..., :ctx], dc.full_causal_mask(4, 2, ctx))
     assert torch.equal(m[..., ctx:], dc.sliding_ring_mask(4, 2, rows))
+
+# ===========================================================================
+# Part 2 -- the model against an independent reference
+#
+# The oracle below is written from math-dory.md 4.0-4.6 in plain torch: no
+# convolutions, no layer-norm trick, no cache, its own RoPE by complex
+# rotation.  Nothing is shared with the module under test.
+# ===========================================================================
+
+import math
+import os
+
+import pytest
+
+from anemll.models import dory_ane_model as dm
+
+TINY = dict(hidden_size=32, intermediate_size=64, num_attention_heads=4,
+            num_key_value_heads=1, head_dim=8, vocab_size=128,
+            context_length=64, batch_size=4, dtype=torch.float32)
+
+
+@pytest.fixture(scope="module")
+def tiny_weights():
+    """A complete, HF-named random Dory checkpoint (tiny dims)."""
+    cfg = TINY
+    g = torch.Generator().manual_seed(1234)
+    H, I, V = cfg["hidden_size"], cfg["intermediate_size"], cfg["vocab_size"]
+    nh, nkv, hd = 4, 1, 8
+    w = {}
+    w["backbone.embeddings.weight"] = torch.randn(V, H, generator=g)
+    w["lm_head.weight"] = torch.randn(V, H, generator=g)
+    w["lm_head.logit_scale"] = torch.rand(V, generator=g) + 0.5
+    for p in range(72):
+        if p % 8 == 6 or p % 8 in (0, 2, 4):
+            w[f"backbone.layers.{p}.mixer.q_proj.weight"] = torch.randn(nh * hd, H, generator=g) * 0.2
+            w[f"backbone.layers.{p}.mixer.k_proj.weight"] = torch.randn(nkv * hd, H, generator=g) * 0.2
+            w[f"backbone.layers.{p}.mixer.v_proj.weight"] = torch.randn(nkv * hd, H, generator=g) * 0.2
+            w[f"backbone.layers.{p}.mixer.o_proj.weight"] = torch.randn(H, nh * hd, generator=g) * 0.2
+            w[f"backbone.layers.{p}.mixer.g_proj.weight"] = torch.randn(nh * hd, H, generator=g) * 0.2
+            w[f"backbone.layers.{p}.mixer.sqk"] = torch.randn(nh * hd, generator=g) * 0.02
+            w[f"backbone.layers.{p}.mixer.s_gate"] = torch.rand(nh * hd, generator=g) * 0.4
+            w[f"backbone.layers.{p}.attn_alpha"] = torch.randn(H, generator=g) * 0.3
+        else:
+            w[f"backbone.layers.{p}.mixer.gate_proj.weight"] = torch.randn(I, H, generator=g) * 0.2
+            w[f"backbone.layers.{p}.mixer.up_proj.weight"] = torch.randn(I, H, generator=g) * 0.2
+            w[f"backbone.layers.{p}.mixer.down_proj.weight"] = torch.randn(H, I, generator=g) * 0.2
+            w[f"backbone.layers.{p}.mixer.suv_gate"] = torch.rand(I, generator=g) + 0.2
+            w[f"backbone.layers.{p}.mixer.suv_up"] = torch.rand(I, generator=g) + 0.2
+            w[f"backbone.layers.{p}.mlp_alpha"] = torch.randn(H, generator=g) * 0.3
+    return w
+
+
+def _write_safetensors(path, tensors):
+    from safetensors.torch import save_file
+    save_file({k: v.contiguous() for k, v in tensors.items()}, path)
+
+
+# -- the oracle ------------------------------------------------------------
+
+def ref_l2(x, eps=1e-6, dim=-1):
+    return x / torch.sqrt((x * x).sum(dim, keepdim=True) + eps)
+
+
+def ref_rope(x, positions, base):
+    """NEOX rotate-half RoPE through complex rotation (independent formulation)."""
+    d = x.shape[-1]
+    half = d // 2
+    inv = base ** (-torch.arange(0, half, dtype=torch.float64) * 2.0 / d)
+    angle = positions.to(torch.float64).view(-1, 1) * inv.view(1, -1)      # (Q, D/2)
+    angle_full = torch.cat([angle, angle], dim=-1).to(torch.float64)       # NEOX duplicates
+    cos = torch.cos(angle_full).to(x.dtype).view(-1, 1, d)   # (Q, 1, D)
+    sin = torch.sin(angle_full).to(x.dtype).view(-1, 1, d)
+    rotated = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+    return x * cos + rotated * sin
+
+
+def ref_block(h, p, w, cfg, positions, mask, sliding_window=1024):
+    """One physical block in the literal (unfolded) order, single batch."""
+    prefix = f"backbone.layers.{p}"
+    H, nh, nkv, hd = cfg["hidden_size"], 4, 1, 8
+    init_std, alpha_init, gate_init = 0.0177, 0.05, 50.59644317626953
+    residual = h
+    k8 = p % 8
+    if k8 in (1, 3, 5, 7):
+        g = h @ w[f"{prefix}.mixer.gate_proj.weight"].T
+        u = h @ w[f"{prefix}.mixer.up_proj.weight"].T
+        g = g * (w[f"{prefix}.mixer.suv_gate"] * math.sqrt(H))
+        u = u * (w[f"{prefix}.mixer.suv_up"] * math.sqrt(H))
+        y = ref_l2(torch.nn.functional.silu(g) * u)
+        f = y @ w[f"{prefix}.mixer.down_proj.weight"].T
+    else:
+        q = (h @ w[f"{prefix}.mixer.q_proj.weight"].T).view(-1, nh, hd)
+        k = (h @ w[f"{prefix}.mixer.k_proj.weight"].T).view(-1, nkv, hd)
+        v = (h @ w[f"{prefix}.mixer.v_proj.weight"].T).view(-1, nkv, hd)
+        base = 1e7 if k8 == 6 else 1e4
+        q = ref_rope(q, positions, base)
+        k = ref_rope(k, positions, base)
+        q = ref_l2(q) * ((w[f"{prefix}.mixer.sqk"] * math.sqrt(hd) / init_std) ** 2).view(nh, hd)
+        k = ref_l2(k)
+        gate = torch.sigmoid(
+            (h @ w[f"{prefix}.mixer.g_proj.weight"].T)
+            * ((w[f"{prefix}.mixer.s_gate"] * math.sqrt(gate_init) / init_std) ** 2))
+        rep = nh // nkv
+        kk = k.repeat_interleave(rep, dim=1).transpose(0, 1)   # (H, Q, D)
+        vv = v.repeat_interleave(rep, dim=1).transpose(0, 1)
+        qq = q.transpose(0, 1)                                  # (H, Q, D)
+        logits = torch.einsum("hqd,hkd->hqk", qq, kk) / math.sqrt(hd) + mask
+        probs = torch.softmax(logits, dim=-1)
+        out = torch.einsum("hqk,hkd->hqd", probs, vv)
+        out = out.transpose(0, 1).reshape(-1, nh * hd)
+        f = ref_l2(out * gate) @ w[f"{prefix}.mixer.o_proj.weight"].T
+    a = ref_l2(residual)
+    b = ref_l2(f)
+    alpha = (w[f"{prefix}.mlp_alpha" if k8 in (1, 3, 5, 7) else f"{prefix}.attn_alpha"]
+             * alpha_init / init_std).abs()
+    return ref_l2(a + (b - a) * alpha)
+
+
+def ref_forward(w, ids, cfg, loops):
+    """Whole-sequence forward in the literal order (single batch == per_loop)."""
+    Q = len(ids)
+    positions = torch.arange(Q)
+    causal = torch.where(positions[:, None] >= positions[None, :],
+                         torch.zeros(Q, Q), torch.full((Q, Q), float("-inf")))
+    h = w["backbone.embeddings.weight"][torch.tensor(ids)].to(torch.float32)
+    for p in range(16):
+        h = ref_block(h, p, w, cfg, positions, causal)
+    h_in = h
+    for _ in range(loops):
+        h = ref_l2(h + h_in)
+        for p in range(16, 56):
+            h = ref_block(h, p, w, cfg, positions, causal)
+        h = ref_l2(h)
+    for p in range(56, 72):
+        h = ref_block(h, p, w, cfg, positions, causal)
+    logits = h @ w["lm_head.weight"].T * (w["lm_head.logit_scale"] / 0.0177)
+    return logits
+
+
+def _build_model(tmp_path, tiny_weights, fold_scales, **extra):
+    path = str(tmp_path / "tiny.safetensors")
+    _write_safetensors(path, tiny_weights)
+    cfg = dm.DoryANEConfig(**{**TINY, "fold_scales": fold_scales, **extra})
+    model = dm.DoryANEForCausalLM(cfg)
+    report = model.load_pretrained_weights(path)
+    assert report["missing"] == [], report["missing"]
+    model.eval()
+    return model
+
+
+@pytest.fixture(scope="module")
+def tiny_model(tmp_path_factory, tiny_weights):
+    return _build_model(tmp_path_factory.mktemp("tiny_folded"), tiny_weights, True)
+
+
+def test_weight_loader_consumes_every_tensor(tmp_path, tiny_weights):
+    model = _build_model(tmp_path, tiny_weights, True)
+    assert model.embed_tokens.weight.dtype == torch.float32
+    # folding is exact and visible: the MLP gate rows carry the suv scale
+    p = 1
+    raw = tiny_weights[f"backbone.layers.{p}.mixer.gate_proj.weight"]
+    suv = tiny_weights[f"backbone.layers.{p}.mixer.suv_gate"] * math.sqrt(32)
+    folded = model.model.layers[1].mixer.gate_proj.weight.detach().view(64, 32)
+    assert torch.allclose(folded, raw * suv.view(-1, 1), rtol=1e-5, atol=1e-6)
+
+
+def _damped(tiny_weights, scale=1e-3):
+    """The same checkpoint with a near-zero residual alpha.
+
+    A random-weight Dory amplifies a 1e-7 rounding difference by ~1.8x per
+    block (the nGPT residual extrapolates), so a *chained* comparison of the
+    whole model is meaningless with a normal alpha.  Damping alpha keeps the
+    chain contractive, which isolates the wiring -- masks, caches, loop entry
+    and exit, chunk order -- while the per-block test above checks the math.
+    """
+    out = dict(tiny_weights)
+    for key, value in tiny_weights.items():
+        if key.endswith(".attn_alpha") or key.endswith(".mlp_alpha"):
+            out[key] = value * scale
+    return out
+
+
+def test_every_block_matches_the_reference(tiny_model, tiny_weights):
+    """Every one of the 72 physical blocks reproduces the literal formula.
+
+    The module block and the oracle are both fed the oracle's input, so this
+    measures one block, not accumulated chaos.
+    """
+    ids = [3, 127, 64, 9, 12, 88, 5, 41]
+    Q = len(ids)
+    positions = torch.arange(Q)
+    causal = torch.where(positions[:, None] >= positions[None, :],
+                         torch.zeros(Q, Q), torch.full((Q, Q), float("-inf")))
+    h = tiny_weights["backbone.embeddings.weight"][torch.tensor(ids)].to(torch.float32)
+    model = tiny_model.model
+    cfg = tiny_model.config
+    mask = tiny_model.build_mask(0, Q)
+    mask_full = mask.narrow(-1, 0, cfg.context_length)
+    mask_sliding = mask.narrow(-1, cfg.context_length, cfg.sliding_rows)
+    cur = torch.tensor([0], dtype=torch.int32)
+    cp = torch.tensor([0], dtype=torch.int32)
+    worst = 0.0
+    for p in range(72):
+        want = ref_block(h, p, tiny_weights, TINY, positions, causal)
+        got = model.layers[p](h.unsqueeze(0), mask_full, mask_sliding,
+                              model.kv_cache_full, model.kv_cache_sliding,
+                              cur, cp).squeeze(0)
+        worst = max(worst, (want - got).abs().max().item())
+        # atol 1e-4: q is multiplied by sq (~1e3 with the real sqk), so the
+        # softmax is saturated and a 1e-7 rounding difference in q shows up as
+        # 1e-4 in the weighted average of v.
+        assert torch.allclose(got, want, rtol=1e-4, atol=1e-4), (p, worst)
+        h = want
+    assert worst < 1e-5, worst
+
+
+def test_full_sequence_forward_matches_the_reference(tmp_path, tiny_weights):
+    """Chained end-to-end (damped alpha): chunks, loops, entry/exit, head."""
+    weights = _damped(tiny_weights)
+    model = _build_model(tmp_path, weights, fold_scales=True)
+    ids = [3, 127, 64, 9, 12, 88, 5, 41]
+    got = model.prefill(ids, 0, loops=2).detach()
+    want = ref_forward(weights, ids, TINY, loops=2)
+    assert torch.allclose(got, want, rtol=1e-3, atol=1e-3), \
+        (got - want).abs().max().item()
+
+
+@pytest.mark.parametrize("loops", [1, 2, 4])
+def test_loop_count_is_just_an_argument(tmp_path, tiny_weights, loops):
+    weights = _damped(tiny_weights)
+    model = _build_model(tmp_path, weights, fold_scales=True)
+    ids = [7, 11, 99, 3]
+    got = model.prefill(ids, 0, loops=loops).detach()
+    want = ref_forward(weights, ids, TINY, loops=loops)
+    assert torch.allclose(got, want, rtol=1e-3, atol=1e-3)
+
+
+def test_folding_scales_is_exact_in_fp32(tmp_path, tiny_weights):
+    """Folded and unfolded FP32 forms agree to FP32 rounding, end to end."""
+    weights = _damped(tiny_weights)         # contractive, so nothing amplifies
+    folded = _build_model(tmp_path, weights, fold_scales=True)
+    unfolded = dm.DoryANEForCausalLM(dm.DoryANEConfig(
+        **{**TINY, "fold_scales": False}))
+    path = str(tmp_path / "tiny.safetensors")
+    _write_safetensors(path, weights)
+    unfolded.load_pretrained_weights(path)
+    ids = [5, 17, 91, 2]
+    a = folded.prefill(ids, 0, loops=2).detach()
+    b = unfolded.prefill(ids, 0, loops=2).detach()
+    scale = b.abs().max().item()
+    assert (a - b).abs().max().item() / scale < 2e-5, (a - b).abs().max().item()
+
+
+def _block_pair(tmp_path, tiny_weights, block):
+    folded = _build_model(tmp_path, tiny_weights, fold_scales=True)
+    path = str(tmp_path / "tiny.safetensors")
+    _write_safetensors(path, tiny_weights)
+    unfolded = dm.DoryANEForCausalLM(dm.DoryANEConfig(**{**TINY, "fold_scales": False}))
+    unfolded.load_pretrained_weights(path)
+    return folded, unfolded
+
+
+@pytest.mark.parametrize("block", [0, 1, 6, 22, 55])
+def test_folding_scales_is_exact_per_block_in_fp32(tmp_path, tiny_weights, block):
+    """The folded weight equals the unfolded weight times its scale, in FP32."""
+    folded, unfolded = _block_pair(tmp_path, tiny_weights, block)
+    ids = [5, 17, 91, 2]
+    h = tiny_weights["backbone.embeddings.weight"][torch.tensor(ids)].unsqueeze(0)
+    m = folded.build_mask(0, len(ids))
+    masks = (m.narrow(-1, 0, 64), m.narrow(-1, 64, folded.config.sliding_rows))
+    args = (h, *masks, folded.model.kv_cache_full, folded.model.kv_cache_sliding,
+            torch.tensor([0]), torch.tensor([0]))
+    uargs = (h, *masks, unfolded.model.kv_cache_full, unfolded.model.kv_cache_sliding,
+             torch.tensor([0]), torch.tensor([0]))
+    a = folded.model.layers[block](*args)
+    b = unfolded.model.layers[block](*uargs)
+    assert (a - b).abs().max().item() < 1e-5, block
