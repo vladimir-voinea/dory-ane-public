@@ -598,3 +598,34 @@ def test_reference_last_loop_semantics(tiny_model):
         want.append(model.logits(h))
     for a, b in zip(got, want):
         assert torch.equal(a, b), (a - b).abs().max().item()
+
+def test_changing_the_loop_count_resets_the_caches(tiny_model):
+    """Spec D4: a different loop count invalidates the cache and starts clean."""
+    ids = [1, 2, 3, 4, 5]
+    tiny_model.set_loops(2)
+    tiny_model.prefill(ids, 0, loops=2)
+    assert tiny_model.model.kv_cache_full.abs().sum() > 0
+    assert tiny_model.model.kv_cache_sliding.abs().sum() > 0
+
+    assert tiny_model.set_loops(4) is True                     # a change resets
+    assert tiny_model.model.kv_cache_full.abs().sum() == 0
+    assert tiny_model.model.kv_cache_sliding.abs().sum() == 0
+
+    assert tiny_model.set_loops(4) is False                    # same count, no reset
+    tiny_model.set_loops(2)
+    tiny_model.prefill(ids, 0, loops=2)
+
+    # a stale cache would contaminate the next run: after the reset the result
+    # must equal a run that never saw the old cache
+    tiny_model.set_loops(4)
+    after_change = tiny_model.prefill(ids, 0, loops=4).detach()
+    fresh = dm.DoryANEForCausalLM(tiny_model.config)
+    fresh.load_state_dict(tiny_model.state_dict())
+    fresh.eval()
+    assert torch.equal(after_change, fresh.prefill(ids, 0, loops=4).detach())
+
+
+def test_loop_count_outside_1_to_4_is_refused(tiny_model):
+    for bad in (0, 5):
+        with pytest.raises(ValueError):
+            tiny_model.set_loops(bad)

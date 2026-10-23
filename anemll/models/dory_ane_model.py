@@ -286,14 +286,12 @@ class DoryANEAttention(nn.Module):
         self.out_norm = DoryL2Norm(self.num_heads * self.head_dim, config.l2_eps)
 
         # sqk stays an elementwise multiply -- it follows an L2 norm (spec D5).
-        self.register_buffer("sq", torch.zeros(self.num_heads * self.head_dim,
-                                               dtype=dt), persistent=False)
+        self.register_buffer("sq", torch.zeros(self.num_heads * self.head_dim, dtype=dt))
         # s_gate squared: folded into g_proj rows, or kept as a vector.
         if fold_scales:
-            self.register_buffer("sg", torch.empty(0), persistent=False)
+            self.register_buffer("sg", torch.empty(0))
         else:
-            self.register_buffer("sg", torch.zeros(self.num_heads * self.head_dim,
-                                                   dtype=dt), persistent=False)
+            self.register_buffer("sg", torch.zeros(self.num_heads * self.head_dim, dtype=dt))
 
     def compute_sq(self, sqk: torch.Tensor, config: DoryANEConfig) -> torch.Tensor:
         kq = math.sqrt(float(self.head_dim)) / float(config.init_std)
@@ -358,13 +356,11 @@ class DoryANEMLP(nn.Module):
         self.down_proj = _conv1x1(config.intermediate_size, config.hidden_size, dt, accum)
         self.norm = DoryL2Norm(config.intermediate_size, config.l2_eps)
         if fold_scales:
-            self.register_buffer("suv_gate", torch.empty(0), persistent=False)
-            self.register_buffer("suv_up", torch.empty(0), persistent=False)
+            self.register_buffer("suv_gate", torch.empty(0))
+            self.register_buffer("suv_up", torch.empty(0))
         else:
-            self.register_buffer("suv_gate", torch.zeros(config.intermediate_size,
-                                                         dtype=dt), persistent=False)
-            self.register_buffer("suv_up", torch.zeros(config.intermediate_size,
-                                                       dtype=dt), persistent=False)
+            self.register_buffer("suv_gate", torch.zeros(config.intermediate_size, dtype=dt))
+            self.register_buffer("suv_up", torch.zeros(config.intermediate_size, dtype=dt))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         h = _to_conv_layout(hidden_states)
@@ -396,8 +392,7 @@ class DoryANEDecoderLayer(nn.Module):
         self.norm_in = DoryL2Norm(config.hidden_size, config.l2_eps)
         self.norm_out = DoryL2Norm(config.hidden_size, config.l2_eps)
         self.norm_mix = DoryL2Norm(config.hidden_size, config.l2_eps)
-        self.register_buffer("alpha", torch.zeros(config.hidden_size,
-                                                  dtype=config.dtype), persistent=False)
+        self.register_buffer("alpha", torch.zeros(config.hidden_size, dtype=config.dtype))
         self.slot = 0
         self.num_slots = 1
 
@@ -541,7 +536,7 @@ class DoryANEForCausalLM(nn.Module):
         self.load_lm_head = load_lm_head
         if load_lm_head:
             self.lm_head = _conv1x1(config.hidden_size, config.vocab_size, dt, config.compute_mode)
-            self.register_buffer("logit_scale", torch.empty(0), persistent=False)
+            self.register_buffer("logit_scale", torch.empty(0))
         else:
             self.lm_head = None
         self._active_loops = None
