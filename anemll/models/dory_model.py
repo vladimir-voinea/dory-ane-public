@@ -389,7 +389,6 @@ class DoryAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
-        self.is_sliding_window = self.sliding_window is not None
         self.rope_theta = config.rope_theta_sliding if self.is_sliding else config.rope_theta
         self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
         self.qk_scale = math.sqrt(self.head_dim) / config.initializer_range

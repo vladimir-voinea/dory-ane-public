@@ -25,7 +25,7 @@ import json
 import os
 import sys
 import hashlib
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 
