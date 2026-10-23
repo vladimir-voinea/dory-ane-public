@@ -84,10 +84,21 @@ def run_precision(path, n_tokens, context_length, threads):
             stats["max_abs"] = max(stats["max_abs"], mx)
         return _hook
 
-    handles = []
+    captured = {}
+
+    def capture_output(_module, _inputs, output):
+        captured["hidden"] = output.detach().float().clone()
+
+    handles = [model.chunk_output.register_forward_hook(capture_output)]
     for layer in model.model.layers:
         handles.append(layer.register_forward_hook(hook(f"block{layer.block}")))
         handles.append(layer.mixer.register_forward_hook(hook(f"block{layer.block}.mixer")))
+        if layer.is_mlp:
+            # the G7 seam: silu(g)*u over 7,168 channels is the largest tensor
+            # in the model, and it is what the MLP L2 normalises
+            def pre_norm(_module, inputs, name=f"block{layer.block}.mlp_prenorm"):
+                hook(name)(None, None, inputs[0])
+            handles.append(layer.mixer.norm.register_forward_pre_hook(pre_norm))
 
     from anemll.eval import load_eval_set
     evalset = load_eval_set()
@@ -100,6 +111,9 @@ def run_precision(path, n_tokens, context_length, threads):
     for h in handles:
         h.remove()
 
+    if "hidden" in captured:
+        torch.save(captured["hidden"], os.path.expanduser(
+            "~/dev/dory-ane-artifacts/DANE-4/hidden_last.pt"))
     stats["logits_finite"] = bool(torch.isfinite(logits).all())
     stats["consumed"] = report["consumed"]
     stats["missing"] = report["missing"]
