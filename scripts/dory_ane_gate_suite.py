@@ -63,13 +63,13 @@ def run_prefill_gate(model, evalset, rows_spec, batch):
                 for step in range(take):
                     lg = model.decode_step(int(ids[pos + step]), pos + step)
                     if want_start <= pos + step < want_stop:
-                        out.append(log_softmax(lg[0, 0]))
+                        out.append(keep_row(lg[0, 0]))
                 pos = len(ids)
                 break
             lg = model.prefill(torch.tensor(ids[pos:pos + take]), pos)
             for i in range(take):
                 if want_start <= pos + i < want_stop:
-                    out.append(log_softmax(lg[0, i]))
+                    out.append(keep_row(lg[0, i]))
             pos += take
             if (pos // take) % 16 == 0:
                 print(f"    prefill {pos}/{len(ids)} tokens, {time.time() - t0:.0f}s",
@@ -95,7 +95,7 @@ def run_decode_gate(model, evalset, rows_spec):
         for pos, tok in enumerate(ids):
             lg = model.decode_step(int(tok), pos)
             if pos >= first_scored + first_row:
-                out.append(log_softmax(lg[0, 0]))
+                out.append(keep_row(lg[0, 0]))
             if pos and pos % 256 == 0:
                 print(f"    decode {pos}/{len(ids)} tokens, {time.time() - t0:.0f}s", flush=True)
         out = np.stack(out)
@@ -104,6 +104,11 @@ def run_decode_gate(model, evalset, rows_spec):
         positions.append(evalset.scored_positions()[chunk * evalset.rows_per_chunk + first_row:
                                                    chunk * evalset.rows_per_chunk + first_row + n_rows])
     return np.concatenate(logprobs), np.concatenate(positions), rows, time.time() - t0
+
+
+def keep_row(logits_row):
+    """One scored row, as float16 (the reference itself is 16-bit)."""
+    return log_softmax(logits_row).astype(np.float16)
 
 
 def score(logprobs, positions, tokens, ref_path, name, out_dir):
