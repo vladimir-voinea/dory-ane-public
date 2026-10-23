@@ -5,9 +5,11 @@ Every later ticket is scored against these files, so they are built by
 llama.cpp (PR #30306) running Dory's BF16 GGUF, exactly the reference the
 published KL table uses:
 
-    exact   dory.recurrent_kv_cache_mode=per_loop   -b 4096 -ub 1024
-            (per_loop keeps a KV cache per loop, so the result is independent
-            of batching and equals a full recompute)
+    exact   dory.recurrent_kv_cache_mode=per_loop   -b 4096 -ub 4096
+            (per_loop keeps a KV cache per loop, and one ubatch per context is
+            a full recompute: splitting the context into ubatches makes the
+            logits batch-dependent once the sliding window is active, so the
+            ubatch must cover the whole context - see ubatch_for())
     decode  dory.recurrent_kv_cache_mode=last_loop  -b N -ub N
             (one KV cache per recurrent layer, overwritten each loop, so the
             result depends on the batching the candidate actually uses)
@@ -69,6 +71,32 @@ def human(size: int) -> str:
     return f"{size / 1e9:.2f} GB" if size >= 1e9 else f"{size / 1e6:.1f} MB"
 
 
+def ubatch_for(mode: str, n_batch: int, ctx: int) -> int:
+    """The -ub that makes each mode mean what it says.
+
+    exact: ONE ubatch covering the whole context (-b ctx -ub ctx). A chunk cut
+    into several ubatches is not a full recompute, because llama.cpp's sliding
+    window (1024 tokens here) masks attention per ubatch. Measured on the BF16
+    GGUF, per_loop, -c 4096 --chunks 1, loops 1, PPL by -ub:
+
+        64 / 256  4.9790 (bit-identical to each other)
+        512       4.9610
+        1024      4.9623
+        2048      4.9662
+        4096      4.9655
+
+    and at loops 2, -ub 1024 against -ub 4096 (both dumps, same text) reads
+    mean KLD 0.0076 / top-1 99.41 % / max 10.7 - the same magnitude as the
+    gates this reference is used to measure. Below ctx 1024 every ubatch
+    setting is bit-identical, so the split only starts to matter exactly when
+    the window begins masking; references built with -ub < ctx must not gate.
+
+    decode: the candidate's own batching is the whole point of the mode, so
+    -ub follows -b (-b 1 -ub 1 for decode steps, -b 64 -ub 64 for prefill).
+    """
+    return max(n_batch, 1) if mode == "decode" else ctx
+
+
 def run_llama_perplexity(
     binary: Path,
     gguf: Path,
@@ -82,7 +110,7 @@ def run_llama_perplexity(
 ) -> dict:
     """Run llama-perplexity and leave out (.kld) plus out.meta.json behind."""
     kv_mode = "per_loop" if mode == "exact" else "last_loop"
-    n_ubatch = max(n_batch, 1) if mode == "decode" else 1024
+    n_ubatch = ubatch_for(mode, n_batch, ctx)
     cmd = [
         str(binary),
         "-m", str(gguf),
@@ -97,7 +125,11 @@ def run_llama_perplexity(
         "--kl-divergence-base", str(out),
     ]
     started = time.time()
-    print(f"[{out.name}] {mode} loops={loops} kv={kv_mode} batch={n_batch} ...", flush=True)
+    print(
+        f"[{out.name}] {mode} loops={loops} kv={kv_mode} "
+        f"batch={n_batch} ubatch={n_ubatch} ...",
+        flush=True,
+    )
     log = out.with_suffix(out.suffix + ".log")
     with open(log, "w") as fh:
         fh.write(" ".join(cmd) + "\n")
@@ -149,7 +181,7 @@ def build_reference(name, spec, args, eval_set, gguf_sha) -> Path:
         "loops": loops,
         "kv_cache_mode": "per_loop" if mode == "exact" else "last_loop",
         "n_batch": n_batch,
-        "n_ubatch": 1024 if mode == "exact" else max(n_batch, 1),
+        "n_ubatch": ubatch_for(mode, n_batch, args.ctx),
         "chunk_size": args.ctx,
         "n_chunks": args.chunks,
         "rows_per_chunk": args.ctx - 1 - args.ctx // 2,
