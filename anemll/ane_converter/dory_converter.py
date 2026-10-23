@@ -25,15 +25,13 @@ precision, CPU_AND_NE, iOS 18 and the mlprogram format.
 
 from __future__ import annotations
 
-import copy
 import json
-import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -246,6 +244,14 @@ def check_disk(path, estimates, reserve_bytes: int = 2 * 1024 ** 3) -> dict:
             f"{reserve_bytes / 1024 ** 3:.0f} GB for the rest of the port. Free "
             f"space (delete a superseded package or a reference) and run again.")
     return {"free": free, "needed": needed}
+
+
+def nearest_existing(path) -> Path:
+    """The closest ancestor of path that exists -- disk_usage needs one."""
+    path = Path(path)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
 
 
 def check_size(label: str, size_bytes: int, limit_bytes: int = MAX_MODEL_BYTES) -> int:
@@ -613,14 +619,27 @@ def placement_report(model_path) -> dict:
 
 
 def assert_ane_only(report: dict, label: str) -> dict:
-    """Fail when any op of any function is not on the Neural Engine."""
-    bad = {fn: counts for fn, counts in report.items()
-           if counts["gpu"] or counts["cpu"]}
+    """Fail unless every function runs its ops on the Neural Engine.
+
+    Two ways to fail, both of them hard: an op attributed to the GPU or the CPU,
+    and a function the compute plan attributed no device to (ane + gpu + cpu ==
+    0).  An empty attribution is not evidence of placement, so it must never
+    read as a pass.
+    """
+    def offending(counts) -> bool:
+        return bool(counts["gpu"] or counts["cpu"]) or not counts["ane"]
+
+    bad = {fn: counts for fn, counts in report.items() if offending(counts)}
     if not bad:
         return report
     lines = []
     for fn, counts in bad.items():
-        lines.append(f"{fn}: {counts['gpu']} GPU, {counts['cpu']} CPU")
+        if counts["ane"] or counts["gpu"] or counts["cpu"]:
+            lines.append(f"{fn}: {counts['ane']} ANE, {counts['gpu']} GPU, "
+                         f"{counts['cpu']} CPU")
+        else:
+            lines.append(f"{fn}: the compute plan attributed no device to any of "
+                         f"{counts['ops']} operations")
         for op in counts["fallbacks"][:20]:
             lines.append(f"  - {op}")
     raise PlacementError(
@@ -868,6 +887,7 @@ class DoryConverter(BaseConverter):
 
     # -- one component end to end -----------------------------------------
     def convert_component(self, name: str) -> Path:
+        """Convert, size-check, save and (unless disabled) placement-gate one component."""
         spec = self.spec(name)
         bits = self.lut_bits.get(spec.lut_role)
         check_size(spec.name, estimate_component_bytes(spec, self.config, bits))
@@ -877,17 +897,7 @@ class DoryConverter(BaseConverter):
         model, wrapper = self.build_component(spec)
         temp_paths = []
         try:
-            saved = []
-            for function, seq in self._functions(spec):
-                converted = self.convert_function(spec, wrapper, seq)
-                converted = self.palettize(converted, bits, f"{spec.name}/{function}")
-                temp = self.output_dir / f".tmp_{self.prefix}_{spec.name}_{function}.mlpackage"
-                shutil.rmtree(temp, ignore_errors=True)
-                converted.save(str(temp))
-                saved.append((function, temp))
-                temp_paths.append(temp)
-                if self.verbose:
-                    print(f"  {spec.name}/{function}: {self._dir_size(temp) / 1024 ** 2:.0f} MB")
+            saved = self._emit_functions(spec, wrapper, bits, temp_paths)
             self._combine(spec, saved, out_path)
             size = self._dir_size(out_path)
             check_size(spec.name, size)
@@ -897,15 +907,37 @@ class DoryConverter(BaseConverter):
                 shutil.rmtree(temp, ignore_errors=True)
             del wrapper
             del model
-        if self.check_placement_gate:
-            report = placement_report(out_path)
-            self.placement[spec.name] = report
-            assert_ane_only(report, f"{spec.name} ({out_path.name})")
+        self._gate_placement(spec, out_path)
         self.seconds[spec.name] = time.time() - started
         if self.verbose:
             print(f"{spec.name}: {out_path.name} {self.sizes[spec.name] / 1024 ** 2:.0f} MB "
                   f"in {self.seconds[spec.name]:.0f}s")
         return out_path
+
+    def _emit_functions(self, spec: ComponentSpec, wrapper, bits, temp_paths) -> list:
+        """Trace, convert, quantize and save each function to a temporary package."""
+        saved = []
+        for function, seq in self._functions(spec):
+            converted = self.convert_function(spec, wrapper, seq)
+            converted = self.palettize(converted, bits, f"{spec.name}/{function}")
+            temp = self.output_dir / f".tmp_{self.prefix}_{spec.name}_{function}.mlpackage"
+            shutil.rmtree(temp, ignore_errors=True)
+            converted.save(str(temp))
+            saved.append((function, temp))
+            temp_paths.append(temp)
+            if self.verbose:
+                print(f"  {spec.name}/{function}: {self._dir_size(temp) / 1024 ** 2:.0f} MB")
+        return saved
+
+    def _gate_placement(self, spec: ComponentSpec, out_path: Path) -> None:
+        """The spec's placement gate: refuse a component that is not all on the ANE."""
+        if not self.check_placement_gate:
+            print(f"WARNING: placement gate skipped for {spec.name}; the spec "
+                  f"requires every op on the Neural Engine", file=sys.stderr)
+            return
+        report = placement_report(out_path)
+        self.placement[spec.name] = report
+        assert_ane_only(report, f"{spec.name} ({out_path.name})")
 
     def _functions(self, spec: ComponentSpec) -> list:
         """(function_name, sequence_length) pairs this component provides."""
@@ -1020,17 +1052,22 @@ class DoryConverter(BaseConverter):
                     copied.append("chat_template.jinja")
         return copied
 
-    def write_artifacts(self) -> dict:
-        """meta.yaml, config.json and a conversion report."""
-        copied = self.copy_tokenizer()
-        source_config = self.model_path / "config.json"
-        if source_config.is_file():
-            shutil.copy2(source_config, self.output_dir / "config.json")
+    def manifest_files(self) -> dict:
+        """Component -> the file the runtime should load (compiled when it exists)."""
         files = {}
         for spec in self.specs:
             compiled = self.output_dir / self.compiled_name(spec)
             files[spec.name] = self.compiled_name(spec) if compiled.exists() \
                 else self.file_name(spec)
+        return files
+
+    def write_artifacts(self) -> dict:
+        """Everything the runtime directory needs: tokenizer, config, meta, report."""
+        copied = self.copy_tokenizer()
+        source_config = self.model_path / "config.json"
+        if source_config.is_file():
+            shutil.copy2(source_config, self.output_dir / "config.json")
+        files = self.manifest_files()
         meta = build_meta(
             config=self.config, specs=self.specs, files=files,
             lut_bits=self.lut_bits, lm_head_chunk_sizes=self.lm_head_chunk_sizes,
@@ -1039,6 +1076,11 @@ class DoryConverter(BaseConverter):
             chat_template=("chat_template.jinja" if "chat_template.jinja" in copied
                            else None))
         yaml_path = write_meta(self.output_dir / "meta.yaml", meta)
+        report_path = self.write_report(meta, copied)
+        return {"meta": str(yaml_path), "report": str(report_path)}
+
+    def write_report(self, meta: dict, tokenizer_files: list) -> Path:
+        """conversion_report.json: sizes, timings and per-function placement."""
         report = {
             "components": {name: {"bytes": self.sizes.get(name),
                                   "seconds": self.seconds.get(name),
@@ -1047,7 +1089,7 @@ class DoryConverter(BaseConverter):
             "estimates": {spec.name: estimate_component_bytes(
                 spec, self.config, self.lut_bits.get(spec.lut_role))
                 for spec in self.specs},
-            "tokenizer_files": copied,
+            "tokenizer_files": list(tokenizer_files),
             "created": meta["model_info"]["created"],
             "config": {
                 "context_length": self.config.context_length,
@@ -1057,9 +1099,10 @@ class DoryConverter(BaseConverter):
                 "recurrent_splits": self.recurrent_splits,
             },
         }
-        with open(self.output_dir / "conversion_report.json", "w", encoding="utf-8") as handle:
+        path = self.output_dir / "conversion_report.json"
+        with open(path, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2)
-        return {"meta": str(yaml_path), "report": str(self.output_dir / "conversion_report.json")}
+        return path
 
     # -- the whole run -----------------------------------------------------
     def convert(self, component="all"):
@@ -1069,8 +1112,11 @@ class DoryConverter(BaseConverter):
         return self.convert_component(component)
 
     def run(self, only=None, dry_run=False, do_compile=True) -> dict:
-        """Convert every component, compile, and write meta.yaml."""
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        """Convert every component, compile, and write meta.yaml.
+
+        A dry run writes nothing at all: it prints the plan, the per-file size
+        guard's verdict and the disk check, and returns.
+        """
         wanted = None if not only else {name.strip() for name in str(only).split(",")}
         plan = [(spec, estimate_component_bytes(spec, self.config,
                                                 self.lut_bits.get(spec.lut_role)))
@@ -1084,14 +1130,15 @@ class DoryConverter(BaseConverter):
                       f"  calls/token={spec.calls_per_token}")
         for spec, size in plan:
             check_size(spec.name, size)
-        disk = check_disk(self.output_dir, plan)
+        disk = check_disk(nearest_existing(self.output_dir), plan)
         if self.verbose:
             print(f"disk: {disk['free'] / 1024 ** 3:.1f} GB free, "
                   f"{disk['needed'] / 1024 ** 3:.1f} GB needed")
         if dry_run:
             return {"dry_run": True, "estimates": {s.name: n for s, n in plan},
-                    "disk": disk}
+                    "disk": disk, "components": {s.name: n for s, n in plan}}
 
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         started = time.time()
         for spec, _ in plan:
             if self.verbose:

@@ -30,8 +30,9 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
-from anemll.ane_converter.dory_converter import MetaError, read_meta
+from anemll.ane_converter.dory_converter import read_meta
 from anemll.utils import dory_caches as dc
 
 __all__ = ["DoryRuntime", "ChatTokenizer", "main", "build_parser"]
@@ -42,13 +43,10 @@ __all__ = ["DoryRuntime", "ChatTokenizer", "main", "build_parser"]
 # ---------------------------------------------------------------------------
 
 def _coreml():
+    # imported where it is used: coremltools takes a second to load, while the
+    # pure helpers (masks, sampling, templates) must stay importable without it.
     import coremltools as ct
     return ct
-
-
-def _torch():
-    import torch
-    return torch
 
 
 def resolve_model_path(model_dir: Path, entry: dict) -> Path:
@@ -150,7 +148,7 @@ class DoryRuntime:
         return dc.build_causal_mask(
             start, q_len, self.params["context_length"],
             self.params["sliding_rows"], self.params["sliding_window"],
-            dtype=_torch().float16).numpy()
+            dtype=torch.float16).numpy()
 
     def _predict(self, name: str, inputs: dict, function: str) -> dict:
         started = time.time()
@@ -246,11 +244,6 @@ class DoryRuntime:
         return self.forward([int(token_id)], pos)[0]
 
     # -- helpers -----------------------------------------------------------
-    @property
-    def eos_ids(self) -> list:
-        ids = {int(self.meta["tokenizer"]["eos_token_id"])}
-        return sorted(ids)
-
     def stats(self) -> dict:
         return {"load_seconds": self.load_seconds,
                 "predict_seconds": self.predict_seconds,
@@ -379,6 +372,25 @@ def build_messages(prompt: str, system: str = None) -> list:
     return messages
 
 
+class StreamPrinter:
+    """Write only the text that is new, so no partial character is emitted."""
+
+    def __init__(self, tokenizer, out=None):
+        self.tokenizer = tokenizer
+        self.out = out or sys.stdout
+        self.printed = 0
+
+    def update(self, token_ids) -> None:
+        piece = self.tokenizer.decode(token_ids)
+        if len(piece) > self.printed:
+            self.out.write(piece[self.printed:])
+            self.out.flush()
+            self.printed = len(piece)
+
+    def done(self) -> None:
+        self.out.write(chr(10))
+
+
 def generate(runtime, tokenizer, prompt, max_tokens=256, temperature=0.0, top_p=1.0,
              reasoning=True, system=None, stream=True, out=sys.stdout):
     """Prefill the prompt, then stream tokens until EOS or max_tokens."""
@@ -393,7 +405,7 @@ def generate(runtime, tokenizer, prompt, max_tokens=256, temperature=0.0, top_p=
     logits = runtime.prefill(prompt_ids, 0)
     prefill_seconds = time.time() - started
     generated = []
-    printing = 0
+    printer = StreamPrinter(tokenizer, out) if stream else None
     pos = len(prompt_ids)
     eos = set(tokenizer.eos_ids)
     while len(generated) < max_tokens and pos < context - 1:
@@ -402,18 +414,14 @@ def generate(runtime, tokenizer, prompt, max_tokens=256, temperature=0.0, top_p=
             break
         generated.append(next_id)
         pos += 1
-        if stream:
-            piece = tokenizer.decode(generated)
-            if len(piece) > printing:
-                out.write(piece[printing:])
-                out.flush()
-                printing = len(piece)
+        if printer is not None:
+            printer.update(generated)
         if len(generated) >= max_tokens or pos >= context - 1:
             break
         logits = runtime.decode(next_id, pos).reshape(1, -1)
     seconds = time.time() - started
-    if stream:
-        out.write("\n")
+    if printer is not None:
+        printer.done()
     return {
         "text": tokenizer.decode(generated),
         "prompt_tokens": int(len(prompt_ids)),
@@ -426,21 +434,28 @@ def generate(runtime, tokenizer, prompt, max_tokens=256, temperature=0.0, top_p=
 
 
 def run_session(args) -> int:
-    """One prompt, or an interactive session with /loops and /reset."""
+    """Load the model, then either answer one prompt or open a session."""
     runtime = DoryRuntime(args.model_dir, verbose=args.verbose)
     tokenizer = ChatTokenizer(Path(args.model_dir), runtime.meta)
     runtime.set_loops(args.loops)
     print(f"loops {runtime.loops}, context {runtime.params['context_length']}, "
           f"reasoning {'on' if not args.no_think else 'off'}", file=sys.stderr)
-
     if args.prompt:
-        result = generate(runtime, tokenizer, args.prompt, args.max_tokens,
-                          args.temperature, args.top_p, not args.no_think,
-                          args.system, args.stream)
-        print(json.dumps({k: v for k, v in result.items() if k != "text"}, indent=2),
-              file=sys.stderr)
-        return 0
+        return _answer_once(args, runtime, tokenizer)
+    return _converse(args, runtime, tokenizer)
 
+
+def _answer_once(args, runtime, tokenizer) -> int:
+    result = generate(runtime, tokenizer, args.prompt, args.max_tokens,
+                      args.temperature, args.top_p, not args.no_think,
+                      args.system, args.stream)
+    print(json.dumps({k: v for k, v in result.items() if k != "text"}, indent=2),
+          file=sys.stderr)
+    return 0
+
+
+def _converse(args, runtime, tokenizer) -> int:
+    """The interactive loop: /loops N, /reset, /quit."""
     print("commands: /loops N  /reset  /quit", file=sys.stderr)
     while True:
         try:
@@ -492,16 +507,23 @@ def _uptime() -> dict:
         return {}
 
 
+def filler_tokens(context: int, tokenizer=None, text=None) -> np.ndarray:
+    """A prompt of exactly context tokens to decode after."""
+    if text:
+        ids = tokenizer.encode(text)
+    else:
+        ids = np.ones(max(context, 1), dtype=np.int32)
+    if len(ids) < context:
+        ids = np.tile(ids, int(np.ceil(context / max(len(ids), 1))))
+    return ids[:context].astype(np.int32)
+
+
 def benchmark(args) -> int:
     """Decode tok/s at a chosen context, for one or more loop counts."""
     runtime = DoryRuntime(args.model_dir, verbose=args.verbose)
     tokenizer = ChatTokenizer(Path(args.model_dir), runtime.meta)
     context = int(args.context)
-    filler = (tokenizer.encode(args.filler_text) if args.filler_text
-              else np.ones(context, dtype=np.int32))
-    if len(filler) < context:
-        filler = np.tile(filler, int(np.ceil(context / max(len(filler), 1))))[:context]
-    prompt = filler[:context].astype(np.int32)
+    prompt = filler_tokens(context, tokenizer, args.filler_text)
     results = []
     for loops in [int(v) for v in str(args.loops).split(",")]:
         runtime.set_loops(loops)
@@ -529,33 +551,53 @@ def benchmark(args) -> int:
     return 0
 
 
+def log_softmax_rows(logits) -> np.ndarray:
+    """Row-wise log-softmax in float32: the distribution DANE-2 scores."""
+    block = np.asarray(logits, dtype=np.float32)
+    block = block - block.max(axis=-1, keepdims=True)
+    return block - np.log(np.exp(block).sum(axis=-1, keepdims=True))
+
+
+def collect_logprobs(runtime, ids, chunk_size: int, max_windows: int = 0,
+                     progress=None):
+    """Feed the evaluation text in windows; return (logprobs, positions).
+
+    Decode mode means the candidate batches the way it runs -- a 64-token
+    prefill per batch, then the tail one token at a time.  The scored rows are
+    the second half of each window, llama-perplexity's convention and what
+    anemll.eval.kld.scored_positions produces.
+    """
+    chunk_size = int(chunk_size)
+    n_chunks = len(ids) // chunk_size
+    if n_chunks < 1:
+        raise ValueError(f"{len(ids)} tokens is shorter than one "
+                         f"{chunk_size}-token window")
+    lo, hi = chunk_size // 2, chunk_size - 1
+    logprobs, positions = [], []
+    for index in range(n_chunks):
+        if max_windows and index >= int(max_windows):
+            break
+        start = index * chunk_size
+        runtime.reset_state()
+        logits = runtime.prefill(ids[start:start + chunk_size], 0)
+        logprobs.append(log_softmax_rows(logits[lo:hi]))
+        positions.append(np.arange(start + lo, start + hi, dtype=np.int32))
+        if progress is not None:
+            progress(index + 1, n_chunks)
+    return np.concatenate(logprobs), np.concatenate(positions)
+
+
 def score(args) -> int:
     """Score the Core ML pipeline in decode mode against a reference (spec gates)."""
     from anemll.eval.kld import score_files, write_candidate
 
     runtime = DoryRuntime(args.model_dir, verbose=args.verbose)
-    tokens_path = Path(args.tokens)
-    ids = np.loadtxt(tokens_path, dtype=np.int64).reshape(-1).astype(np.int32)
+    ids = np.loadtxt(Path(args.tokens), dtype=np.int64).reshape(-1).astype(np.int32)
     chunk = int(args.chunk_size)
-    n_chunks = len(ids) // chunk
-    if n_chunks < 1:
-        raise ValueError(f"{len(ids)} tokens is shorter than one {chunk}-token window")
     runtime.set_loops(int(args.loops))
-    logprobs, positions = [], []
-    for index in range(n_chunks):
-        start = index * chunk
-        if args.max_windows and index >= int(args.max_windows):
-            break
-        runtime.reset_state()
-        logits = runtime.prefill(ids[start:start + chunk], 0)
-        lo, hi = chunk // 2, chunk - 1
-        block = np.asarray(logits[lo:hi], dtype=np.float32)
-        block -= block.max(axis=-1, keepdims=True)
-        block -= np.log(np.exp(block).sum(axis=-1, keepdims=True))
-        logprobs.append(block)
-        positions.append(np.arange(start + lo, start + hi, dtype=np.int32))
-        if args.verbose:
-            print(f"window {index + 1}/{n_chunks}", file=sys.stderr)
+    progress = (lambda done, total: print(f"window {done}/{total}", file=sys.stderr)) \
+        if args.verbose else None
+    logprobs, positions = collect_logprobs(runtime, ids, chunk, args.max_windows, progress)
     payload = {
         "model": "dory-coreml",
         "loops": int(args.loops),
@@ -565,8 +607,7 @@ def score(args) -> int:
         "trace": "coreml",
         "machine": _uptime(),
     }
-    candidate = write_candidate(args.out, np.concatenate(logprobs),
-                                np.concatenate(positions), ids, payload)
+    candidate = write_candidate(args.out, logprobs, positions, ids, payload)
     print(f"wrote {candidate}", file=sys.stderr)
     if args.reference:
         result = score_files(args.reference, candidate)
