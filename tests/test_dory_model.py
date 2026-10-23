@@ -446,9 +446,13 @@ def test_greedy_generation_matches_llama_cpp():
     """First 32 greedy tokens from a chat-template prompt, loops=2, vs llama.cpp."""
     from transformers import AutoTokenizer
 
-    expected_path = os.path.join(EVAL_DIR, "greedy-loop2.json")
+    expected_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fixtures", "dory_greedy", "greedy-loop2.json"
+    )
     if not os.path.isfile(expected_path):
-        _skip("no llama.cpp greedy reference at %s" % expected_path)
+        expected_path = os.path.join(EVAL_DIR, "greedy-loop2.json")
+    if not os.path.isfile(expected_path):
+        _skip("no llama.cpp greedy reference (tests/fixtures/dory_greedy/greedy-loop2.json)")
     if not os.path.isfile(os.path.join(WEIGHTS, "tokenizer.json")):
         _skip("no tokenizer under DORY_WEIGHTS")
     with open(expected_path) as handle:
