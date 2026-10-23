@@ -136,3 +136,77 @@ implies.  The choice is recorded in `meta.yaml` (`tokenizer.chat_template` or
   loops in decode mode.
 - **Speed**: `bench` reports decode tok/s per loop count.  Timings are only
   meaningful on a quiet machine -- record `uptime` beside them.
+
+## Ticket evidence (DANE-5 acceptance criteria)
+
+Measured numbers live here; anything not yet measured says so.  Timings are
+only comparable on a quiet machine, so each one is recorded with the load
+average it was taken under.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| One command produces the chunks and meta, and stops with a clear message if a file would exceed ~2 GB | **implemented and unit-tested**, conversion not yet run | `scripts/convert_dory.py`; estimates at 1K context and LUT6: embeddings 653 MB, input 735 MB, recurrent 1837 MB (91 % of the 2 GB limit), output 735 MB, LM head 336 MB. The guard refuses a LUT8 recurrent block (2.29 GB) with a message naming `--recurrent-splits 2` and `--lut-blocks 4` |
+| Every op of every chunk on the ANE, converter checks itself | **implemented**, not yet measured on the real chunks | `placement_report()` walks every operation of every function with `MLComputePlan` after `xcrun coremlcompiler`; `assert_ane_only()` fails the run and names the offending ops. Trace + `ct.convert` with both states was verified on a small module (conversion OK, package compiles); the real-dimension run is blocked by machine memory |
+| Mean KLD <= 0.05, top-1 >= 93 % at 2 loops, decode mode, 1K windows | **not yet measured - machine blocked** | `python -m anemll.dory_chat score` writes DANE-2's candidate format and calls `anemll.eval.kld.score_files`; the 1K-window decode reference still has to be built (command below) |
+| Chat streams a coherent answer with reasoning on at loops 1, 2 and 4; a mid-session loop change resets the cache and says so | **runtime implemented and unit-tested**, no real answer yet | `/loops N` resets the shared `MLState` and prints why; reasoning on by default through the chat template; generation stops on EOS 11 and 2 |
+| First-load ANE compile cached, second start measurably faster | **not yet measured - machine blocked** | the converter emits `.mlmodelc` next to `.mlpackage` and the runtime prefers the compiled form; `bench` reports `load_seconds` |
+| Decode tok/s at 1K for loops 1, 2 and 4 | **not yet measured - machine blocked** | `python -m anemll.dory_chat bench --context 1024 --loops 1,2,4` |
+
+Facts established while building it (worth knowing before the first real run):
+
+- a 16-block chunk with both cache states traces with `torch.jit.trace` (the
+  ring write `cache[slot:slot+1, :, cache_pos:cache_pos+seq, :] = k` survives
+  tracing) and converts with `ct.convert(..., states=..., FLOAT16,
+  CPU_AND_NE, iOS18, mlprogram)`;
+- coremltools 8.3 renames state names (`model.kv_cache_full` ->
+  `model_kv_cache_full`, dots are not allowed), consistently across components,
+  so the union rule is satisfied by building every component the same way;
+- the state union at 1K context is 36 MiB of full caches plus 108 MiB of
+  sliding caches, per `meta.yaml`;
+- the BF16 repository has **no chat template** (see above), so the runtime
+  records and uses a documented ChatML fallback with an open think block.
+
+## Gate commands (run when the machine is quiet)
+
+    # 0. reference: 1K-window decode mode at 2 loops (BF16 GGUF, one token per
+    #    step would be batch 1; the Core ML pipeline prefills in 64-token
+    #    batches, so the matching reference is batch 64)
+    python scripts/make_dory_references.py all \
+        --llama-perplexity ~/.unsloth/llama.cpp-dory/build/bin/llama-perplexity \
+        --bf16-gguf <BF16.gguf> --out-dir ~/dev/dory-ane-artifacts/DANE-5/refs-1k \
+        --ctx 1024 --chunks 8 --only bf16_decode_loop2_batch64 --skip-q8
+
+    # 1. conversion (dry run first: plan, estimates, disk check, no output)
+    python scripts/convert_dory.py --context-length 1024 --dry-run
+    python scripts/convert_dory.py --context-length 1024
+
+    # 2. placement, independently of the converter's own gate
+    for f in ~/dev/dory-ane-artifacts/DANE-5/1024ctx/*.mlpackage; do
+        python anemll/utils/ane_profiler.py --model "$f" --analyze | tail -20
+    done
+
+    # 3. quality: KLD and top-1 at 2 loops, decode mode, 1K windows
+    python -m anemll.dory_chat score \
+        --model-dir ~/dev/dory-ane-artifacts/DANE-5/1024ctx \
+        --chunk-size 1024 --loops 2 \
+        --out ~/dev/dory-ane-artifacts/DANE-5/cand-coremll-lut6-loop2-1k.npz \
+        --reference ~/dev/dory-ane-artifacts/DANE-5/refs-1k/bf16_decode_loop2_batch64.kld
+
+    # 4. chat at loops 1, 2 and 4, reasoning on
+    for n in 1 2 4; do
+        python -m anemll.dory_chat chat --model-dir ~/dev/dory-ane-artifacts/DANE-5/1024ctx \
+            --loops $n --prompt "Why is the sky blue?" --max-tokens 200
+    done
+
+    # 5. decode speed at 1K (record uptime beside it)
+    python -m anemll.dory_chat bench --model-dir ~/dev/dory-ane-artifacts/DANE-5/1024ctx \
+        --context 1024 --loops 1,2,4 --tokens 32
+
+    # 6. compile cache: first start vs second start of the same runtime
+    python - <<'PY'
+    import time, json
+    from anemll.dory_chat import DoryRuntime
+    d = "~/dev/dory-ane-artifacts/DANE-5/1024ctx"
+    for i in (1, 2):
+        t = time.time(); r = DoryRuntime(d, verbose=False); print(i, "load", round(time.time()-t, 2), "s")
+    PY
