@@ -448,3 +448,153 @@ def test_folding_scales_is_exact_per_block_in_fp32(tmp_path, tiny_weights, block
     a = folded.model.layers[block](*args)
     b = unfolded.model.layers[block](*uargs)
     assert (a - b).abs().max().item() < 1e-5, block
+
+# ===========================================================================
+# Part 3 -- D5 structural guarantees and the decode path
+# ===========================================================================
+
+def test_gqa_attention_matches_a_materialised_repeat(tiny_model):
+    """The reshape-only GQA is numerically identical to repeat_kv + einsum."""
+    attn = tiny_model.model.layers[0].mixer
+    bsz, q_len = 1, 5
+    hidden = torch.randn(bsz, q_len, tiny_model.config.hidden_size)
+    mask = tiny_model.build_mask(0, q_len)
+    mask_full = mask.narrow(-1, 0, tiny_model.config.context_length)
+    tiny_model.model.reset_caches()
+    got = attn(hidden, mask_full, tiny_model.model.kv_cache_full, attn.slot,
+               attn.num_slots, torch.tensor([0]), torch.tensor([0]))
+
+    # oracle: repeat K/V, bmm over q heads
+    with torch.no_grad():
+        conv_in = hidden.permute(0, 2, 1).unsqueeze(2)
+        q = attn.q_proj(conv_in).squeeze(2).permute(0, 2, 1)
+        k = attn.k_proj(conv_in).squeeze(2).permute(0, 2, 1)
+        v = attn.v_proj(conv_in).squeeze(2).permute(0, 2, 1)
+        gate = torch.sigmoid(attn.g_proj(conv_in).squeeze(2).permute(0, 2, 1))
+        q = attn.rope(q.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2), 0, q_len)
+        k = attn.rope(k.view(bsz, q_len, attn.num_kv_heads, attn.head_dim).transpose(1, 2), 0, q_len)
+        q = attn.q_norm(q) * attn.sq.view(1, attn.num_heads, 1, attn.head_dim)
+        k = attn.k_norm(k)
+        key_cache, value_cache = dc.read_cache_slot(
+            tiny_model.model.kv_cache_full, attn.slot, attn.num_slots, mask_full.shape[-1])
+        kk = key_cache.repeat_interleave(attn.rep, dim=1)
+        vv = value_cache.repeat_interleave(attn.rep, dim=1)
+        scores = torch.matmul(q, kk.transpose(-1, -2)) * attn.scale + mask_full
+        probs = torch.softmax(scores, dim=-1)
+        out = torch.matmul(probs, vv)
+        out = out.transpose(1, 2).reshape(bsz, q_len, -1)
+        want = _from_conv_layout_for_test(attn.o_proj(_to_conv_layout_for_test(attn.out_norm(out * gate))))
+    assert torch.allclose(got, want, rtol=1e-4, atol=1e-5)
+
+
+def _to_conv_layout_for_test(x):
+    return x.permute(0, 2, 1).unsqueeze(2)
+
+
+def _from_conv_layout_for_test(x):
+    return x.squeeze(2).permute(0, 2, 1)
+
+
+def test_attention_never_materialises_a_repeat_of_kv(tiny_model):
+    """No op inside the attention block creates an H x K x D copy of the cache.
+
+    The largest tensor the block may create is a logits tensor of size
+    B * H * Q * K; a repeat of K/V would be H * K * D, which for the real
+    model (16 heads, 24,576 rows, 256 dims) is 400 MB per layer per step.
+    """
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Recorder(TorchDispatchMode):
+        def __init__(self):
+            self.sizes = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            if isinstance(out, torch.Tensor) and out.is_floating_point():
+                self.sizes.append((str(func), out.numel()))
+            return out
+
+    attn = tiny_model.model.layers[0].mixer
+    hidden = torch.randn(1, 4, tiny_model.config.hidden_size)
+    mask = tiny_model.build_mask(0, 4).narrow(-1, 0, tiny_model.config.context_length)
+    tiny_model.model.reset_caches()
+    with Recorder() as rec:
+        attn(hidden, mask, tiny_model.model.kv_cache_full, attn.slot, attn.num_slots,
+             torch.tensor([0]), torch.tensor([0]))
+    k_rows = mask.shape[-1]
+    h, kv, d = attn.num_heads, attn.num_kv_heads, attn.head_dim
+    repeated_kv = h * k_rows * d
+    assert max(size for _, size in rec.sizes) < repeated_kv, \
+        sorted(rec.sizes, key=lambda kv: -kv[1])[:5]
+
+
+def test_cached_decode_equals_one_batch_prefill_at_one_loop(tmp_path, tiny_weights):
+    """With one loop, last_loop and per_loop coincide: stepping == one batch."""
+    model = _build_model(tmp_path, _damped(tiny_weights), fold_scales=True)
+    ids = [4, 8, 15, 16, 23, 42]
+    one_batch = model.prefill(ids, 0, loops=1).detach()
+    model.reset_caches()
+    stepped = torch.cat([model.decode_step(tok, i, loops=1) for i, tok in enumerate(ids)],
+                        dim=1)
+    # identical math, different matmul shapes: the difference is float32
+    # rounding relative to the logit scale (a few 1e-7 relative)
+    worst = (stepped - one_batch).abs().max().item()
+    assert worst < 1e-5 * one_batch.abs().max().item(), worst
+
+
+def test_last_loop_batching_differs_from_one_batch_at_two_loops(tiny_model):
+    """The decode path really is last_loop: its result differs from per_loop.
+
+    This is the guard that the cache path is not silently the exact path.
+    """
+    ids = [4, 8, 15, 16, 23, 42]
+    tiny_model.set_loops(2)
+    tiny_model.reset_caches()
+    one_batch = tiny_model.prefill(ids, 0, loops=2).detach()
+    tiny_model.reset_caches()
+    stepped = torch.cat([tiny_model.decode_step(tok, i, loops=2) for i, tok in enumerate(ids)],
+                        dim=1)
+    assert not torch.allclose(stepped, one_batch, rtol=1e-3, atol=1e-3)
+
+
+def test_reference_last_loop_semantics(tiny_model):
+    """Decode against an explicit per-position final-loop cache.
+
+    The reference keeps, per attention block, the K/V of the *last* loop of
+    every earlier position and concatenates the current loop's row -- the
+    definition of last_loop -- using the module's own blocks, so any
+    difference is a cache/mask/loop-wiring difference, not rounding.
+    """
+    ids = [4, 8, 15, 16, 23]
+    model = tiny_model
+    cfg = model.config
+    model.set_loops(2)
+    model.reset_caches()
+    got = [model.decode_step(tok, i, loops=2) for i, tok in enumerate(ids)]
+
+    # oracle on scratch caches: one linear cache per physical attention block
+    full = torch.zeros_like(model.model.kv_cache_full)
+    sliding = torch.zeros_like(model.model.kv_cache_sliding)
+    model.model.reset_caches()
+    want = []
+    for p, tok in enumerate(ids):
+        cur = torch.tensor([p], dtype=torch.int32)
+        mask = model.build_mask(p, 1)
+        mf = mask.narrow(-1, 0, cfg.context_length)
+        ms = mask.narrow(-1, cfg.context_length, cfg.sliding_rows)
+        h = model.embed_tokens(torch.tensor([[tok]]))
+        for i in range(cfg.input_layer_count):
+            h = model.model.layers[i](h, mf, ms, full, sliding, cur, cur)
+        h_in = h
+        for _ in range(2):
+            h = model.model.l2(h + h_in)
+            for i in range(cfg.input_layer_count,
+                           cfg.input_layer_count + cfg.recurrent_layer_count):
+                h = model.model.layers[i](h, mf, ms, full, sliding, cur, cur)
+            h = model.model.l2(h)
+        for i in range(cfg.input_layer_count + cfg.recurrent_layer_count,
+                       cfg.num_hidden_layers):
+            h = model.model.layers[i](h, mf, ms, full, sliding, cur, cur)
+        want.append(model.logits(h))
+    for a, b in zip(got, want):
+        assert torch.equal(a, b), (a - b).abs().max().item()
