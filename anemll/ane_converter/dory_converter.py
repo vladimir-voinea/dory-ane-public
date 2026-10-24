@@ -162,6 +162,56 @@ def input_spec(name: str, seq: int, config):
     return (1, int(seq), int(config.hidden_size)), config.dtype, np.float16
 
 
+#: The RoPE row tables travel beside the package when rope_tables_as_inputs is on.
+ROPE_TABLE_FILE = "rope_tables.npz"
+ROPE_TABLE_KEYS = ("cos_sliding", "sin_sliding", "cos_full", "sin_full")
+
+
+def rope_tables(config) -> dict:
+    """The four cos/sin row tables, built by the model's own rotary module.
+
+    Exported once at conversion time so the runtime slices rows instead of
+    computing them: the formula lives in one place, DoryANERotaryEmbedding, which
+    is also where the graph's constant table came from.  Two implementations of
+    the same table would be exactly the drift this version of the converter is
+    meant to remove.
+    """
+    dtype = getattr(config, "dtype", torch.float16)
+    if dtype not in (torch.float16, torch.float32):
+        raise SystemExit(f"cannot export RoPE tables as {dtype}: float16 or float32 only")
+    rows = int(config.context_length) + 1
+    tables = {}
+    for kind, base in (("sliding", float(config.rope_theta_sliding)),
+                       ("full", float(config.rope_theta_full))):
+        module = dam.DoryANERotaryEmbedding(int(config.head_dim), base, rows, dtype)
+        tables[f"cos_{kind}"] = module.cos_cached.detach().cpu().numpy()
+        tables[f"sin_{kind}"] = module.sin_cached.detach().cpu().numpy()
+    return {name: tables[name] for name in ROPE_TABLE_KEYS}
+
+
+def rope_table_descriptor(config):
+    """What the meta records about the sidecar, or None when it is not written."""
+    if not tiling_flags(config)[1]:
+        return None
+    return {
+        "file": ROPE_TABLE_FILE,
+        "rows": int(config.context_length) + 1,
+        "head_dim": int(config.head_dim),
+        "dtype": "float16" if getattr(config, "dtype", torch.float16) is torch.float16
+                 else "float32",
+        "keys": list(ROPE_TABLE_KEYS),
+    }
+
+
+def write_rope_tables(config, output_dir) -> Path:
+    """Write the sidecar next to the package; returns its path."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / ROPE_TABLE_FILE
+    np.savez_compressed(path, **rope_tables(config))
+    return path
+
+
 def tiling_flags(config) -> tuple:
     """(tiled, rope_tables) as the components of this config must be built."""
     tiles = tuple(getattr(config, "full_tiles", (1,)) or (1,))
@@ -454,6 +504,7 @@ def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="d
                                  (getattr(config, "full_tiles", (1,)) or (1,))],
             "full_cache_tiled": bool(tiling_flags(config)[0]),
             "rope_tables_as_inputs": bool(tiling_flags(config)[1]),
+            "rope_tables": rope_table_descriptor(config),
             "lut_embeddings": _lut_value(lut_bits.get("embeddings")),
             "lut_blocks": _lut_value(lut_bits.get("blocks")),
             "lut_lm_head": _lut_value(lut_bits.get("lm_head")),
@@ -563,6 +614,28 @@ def validate_meta(meta) -> list:
         need(sum(int(r) for r in tiles) == context,
              f"full_cache_tiles {list(tiles)} sum to {sum(int(r) for r in tiles)}, "
              f"not context_length {context}")
+
+    rope_inputs = bool(params.get("rope_tables_as_inputs", False))
+    declared = params.get("rope_tables")
+    if rope_inputs:
+        need(isinstance(declared, dict),
+             "parameters.rope_tables must describe the sidecar when "
+             "rope_tables_as_inputs is on")
+        if isinstance(declared, dict):
+            rows = declared.get("rows")
+            need(isinstance(rows, int) and isinstance(context, int) and rows >= context + 1,
+                 f"parameters.rope_tables.rows ({rows}) must cover context_length + 1 "
+                 f"({context + 1 if isinstance(context, int) else '?'})")
+            need(declared.get("head_dim") == params.get("head_dim"),
+                 f"parameters.rope_tables.head_dim ({declared.get('head_dim')}) must equal "
+                 f"parameters.head_dim ({params.get('head_dim')})")
+            need(bool(declared.get("file")), "parameters.rope_tables.file is required")
+            need(list(declared.get("keys") or []) == list(ROPE_TABLE_KEYS),
+                 f"parameters.rope_tables.keys must be {list(ROPE_TABLE_KEYS)}, "
+                 f"got {declared.get('keys')}")
+    else:
+        need(declared in (None, {}),
+             f"parameters.rope_tables is set ({declared!r}) but rope_tables_as_inputs is off")
 
     tokenizer = meta.get("tokenizer") or {}
     need(bool(tokenizer.get("file")), "tokenizer.file is required")
@@ -1239,6 +1312,11 @@ class DoryConverter(BaseConverter):
         if source_config.is_file():
             shutil.copy2(source_config, self.output_dir / "config.json")
         files = self.manifest_files()
+        if tiling_flags(self.config)[1]:
+            table_path = write_rope_tables(self.config, self.output_dir)
+            if self.verbose:
+                print(f"wrote {table_path.name}: "
+                      f"{table_path.stat().st_size / 1024 ** 2:.1f} MB", file=sys.stderr)
         meta = build_meta(
             config=self.config, specs=self.specs, files=files,
             lut_bits=self.lut_bits, lm_head_chunk_sizes=self.lm_head_chunk_sizes,
