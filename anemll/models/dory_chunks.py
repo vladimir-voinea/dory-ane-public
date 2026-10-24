@@ -90,7 +90,7 @@ def state_names(config=None, prefix: str = "model") -> tuple:
     return tuple(f"{prefix}.{attr}" for attr in state_attrs(config))
 
 
-def block_input_names(tiled: bool, loop_entry: bool) -> list:
+def block_input_names(tiled: bool, loop_entry: bool, rope_tables: bool = False) -> list:
     """The traced input names of a block component, in signature order.
 
     The converter, the traced wrapper and the runtime's call must agree on this
@@ -101,6 +101,9 @@ def block_input_names(tiled: bool, loop_entry: bool) -> list:
     names = ["hidden_states", "causal_mask", "current_pos", "cache_pos"]
     if tiled:
         names += ["write_index_1", "write_gate_1", "write_index_2", "write_gate_2"]
+    if rope_tables:
+        # the four cos/sin tensors the host slices from its own tables (24K)
+        names += ["cos_sliding", "sin_sliding", "cos_full", "sin_full"]
     if loop_entry:
         names.append("h_in")
     return names

@@ -362,3 +362,30 @@ def test_decode_past_the_context_is_refused():
     context = int(runtime.params["context_length"])
     with pytest.raises(chat.ContextOverflowError):
         runtime.decode(1, context)
+
+
+def test_rope_tables_as_inputs_is_the_same_math(weights_path):
+    """The 24K option: cos/sin rows come in as inputs instead of constants.
+
+    At 24,576 rows the tables are ~100 MB of graph constants per package (600 MB
+    in the recurrent chunk, against the 2 GB file limit) and slicing a constant
+    with a runtime position is a placement risk.  The host hands the same rows in
+    instead; the numbers must not move, so the two configurations are compared
+    on the same weights, prefill and decode.
+    """
+    from anemll.models import dory_ane_model as dm
+
+    ids = [3, 127, 64, 9, 12, 88, 5, 41]
+    with_tables = _build(weights_path, dm)
+    as_inputs = _build(weights_path, dm, rope_tables_as_inputs=True)
+    got = as_inputs.prefill(ids, 0, loops=2).detach()
+    want = with_tables.prefill(ids, 0, loops=2).detach()
+    assert torch.equal(got, want)
+    with_tables.reset_caches()
+    as_inputs.reset_caches()
+    with_tables.prefill(ids, 0, loops=1)
+    as_inputs.prefill(ids, 0, loops=1)
+    got = as_inputs.decode_step(23, len(ids), loops=1).detach()
+    want = with_tables.decode_step(23, len(ids), loops=1).detach()
+    assert torch.equal(got, want)
+
