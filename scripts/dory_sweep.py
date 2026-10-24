@@ -959,19 +959,159 @@ def _print_missing(missing: Sequence[Requirement]) -> None:
           "cell: measure the cells above and run this again.")
 
 
+def _record_all(results: dict, results_path: Path, values: dict, *,
+                artifacts: Sequence[str]) -> None:
+    """Record every cell of a measuring command, then save the store."""
+    command = " ".join(sys.argv[1:])
+    for key, value in values.items():
+        record(results, key, value, command=command, artifacts=artifacts)
+    save_results(results, results_path)
+
+
+def _cmd_plan(args, results, results_path) -> int:
+    missing = missing_cells(results, energy_pending=False)
+    print(f"sweep store: {results_path} ({len(results['cells'])} cells measured)")
+    print(f"shipping configuration: {choose_shipping(results) or 'undecided'}")
+    required = [need for need in required_cells(results) if need.key != "shipping"]
+    print(f"required measurements: {len(required)}, missing: {len(missing)}")
+    if missing:
+        print("")
+        _print_missing(missing)
+    return 0
+
+
+def _cmd_sizes(args, results, results_path) -> int:
+    value = measure_sizes(args.model_dir, args.config)
+    record(results, size_key(args.config), value,
+           command=" ".join(sys.argv[1:]),
+           artifacts=[Path(args.model_dir) / "meta.yaml"])
+    results["configs"].setdefault(args.config, {}).update(
+        {"lut_blocks": value["lut_blocks"], "lut_lm_head": value["lut_lm_head"],
+         "model_dir": value["model_dir"], "context_length": value["context_length"]})
+    save_results(results, results_path)
+    print(json.dumps(value, indent=2))
+    return 0
+
+
+def _cmd_score(args, results, results_path) -> int:
+    candidate = (Path(args.candidate) if args.candidate
+                 else Path(args.results).parent / f"cand-{args.config}-loop{args.loops}.npz")
+    if args.candidate is None:
+        argv_ = dory_chat_score_command(
+            args.model_dir, candidate, loops=args.loops, chunk_size=args.chunk_size,
+            max_windows=args.max_windows, tokens_file=args.tokens_file)
+        print("running: " + " ".join(argv_))
+        completed = subprocess.run(argv_, capture_output=True, text=True)
+        if completed.returncode != 0:
+            print(completed.stdout[-2000:])
+            print(completed.stderr[-2000:], file=sys.stderr)
+            raise SystemExit(f"dory_chat score failed (rc {completed.returncode})")
+    value = score_candidate(args.reference, candidate)
+    value.update({"reference": str(args.reference), "candidate": str(candidate),
+                  "config": args.config, "loops": int(args.loops)})
+    record(results, kld_key(args.config, args.loops), value,
+           command=" ".join(sys.argv[1:]),
+           artifacts=[args.reference, candidate])
+    save_results(results, results_path)
+    print(json.dumps(value, indent=2))
+    return 0
+
+
+def _cmd_speed(args, results, results_path) -> int:
+    values = measure_speed(args.model_dir, args.config, _parse_ints(args.contexts),
+                           _parse_ints(args.loops), tokens=args.tokens)
+    _record_all(results, results_path, values,
+                artifacts=[Path(args.model_dir) / "meta.yaml"])
+    print(json.dumps(values, indent=2))
+    return 0
+
+
+def _cmd_gpu(args, results, results_path) -> int:
+    values = measure_gpu(args.gguf, _parse_ints(args.contexts), _parse_ints(args.loops),
+                         tokens=args.tokens, port=args.port,
+                         llama_server=args.llama_server)
+    _record_all(results, results_path, values, artifacts=[args.gguf])
+    print(json.dumps(values, indent=2))
+    return 0
+
+
+def _cmd_energy_plan(args, results, results_path) -> int:
+    chosen = choose_shipping(results)
+    if chosen is None:
+        print("# The shipping configuration is not chosen yet: the quality and")
+        print("# gate-speed cells decide it.  The command below works for whichever")
+        print("# configuration wins.")
+        print("")
+        chosen = "<shipping config>"
+    print(energy_plan(chosen))
+    return 0
+
+
+def _cmd_energy(args, results, results_path) -> int:
+    config = args.config or (choose_shipping(results) if args.build == "ane"
+                             else GPU_CONFIG) or CONFIG_NAMES[-1]
+    value = energy_from_log(args.log, args.build, args.tokens, args.seconds)
+    record(results, energy_key(args.build, config, args.context, args.loops), value,
+           command=" ".join(sys.argv[1:]), artifacts=[args.log])
+    save_results(results, results_path)
+    print(json.dumps(value, indent=2))
+    return 0
+
+
+def _cmd_report(args, results, results_path) -> int:
+    """Both 'report' and 'check': the second renders without writing."""
+    try:
+        table = render_markdown(results, energy_pending=args.energy_pending)
+    except SweepIncomplete as incomplete:
+        _print_missing(incomplete.missing)
+        return 2
+    if choose_shipping(results) is None:
+        print(table)
+        print("The sweep is complete but NO configuration meets every gate; "
+              "nothing is shipped.", file=sys.stderr)
+        return 3
+    if args.command == "check":
+        print(table)
+        return 0
+    written = write_report(results, Path(args.out), energy_pending=args.energy_pending)
+    print(f"wrote {written}")
+    return 0
+
+
+#: One handler per subcommand, attached with set_defaults(func=...) so the
+#: dispatch is the parser's job -- the same shape anemll/eval/kld.py and
+#: anemll/dory_chat.py use, and no if-ladder to keep in step with the parser.
+HANDLERS = {
+    "plan": _cmd_plan,
+    "sizes": _cmd_sizes,
+    "score": _cmd_score,
+    "speed": _cmd_speed,
+    "gpu": _cmd_gpu,
+    "energy-plan": _cmd_energy_plan,
+    "energy": _cmd_energy,
+    "report": _cmd_report,
+    "check": _cmd_report,
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--results", default=str(RESULTS_PATH),
                         help="where the measurements are stored")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=True, metavar="command")
 
-    sub.add_parser("plan", help="what the sweep needs, measured and missing")
+    def add(name: str, help_text: str):
+        command = sub.add_parser(name, help=help_text)
+        command.set_defaults(func=HANDLERS[name])
+        return command
 
-    sizes = sub.add_parser("sizes", help="package bytes for one converted configuration")
+    add("plan", "what the sweep needs, measured and missing")
+
+    sizes = add("sizes", "package bytes for one converted configuration")
     sizes.add_argument("--config", required=True, choices=CONFIG_NAMES)
     sizes.add_argument("--model-dir", required=True)
 
-    score = sub.add_parser("score", help="mean KLD and top-1 against a reference")
+    score = add("score", "mean KLD and top-1 against a reference")
     score.add_argument("--config", required=True, choices=CONFIG_NAMES)
     score.add_argument("--loops", type=int, required=True, choices=LOOPS)
     score.add_argument("--model-dir", required=True)
@@ -982,7 +1122,7 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--max-windows", type=int, default=0)
     score.add_argument("--tokens-file", default=None)
 
-    speed = sub.add_parser("speed", help="prefill and decode tok/s on the Neural Engine")
+    speed = add("speed", "prefill and decode tok/s on the Neural Engine")
     speed.add_argument("--config", required=True, choices=CONFIG_NAMES)
     speed.add_argument("--model-dir", required=True)
     speed.add_argument("--contexts", default=",".join(str(v) for v in CONTEXTS))
@@ -990,7 +1130,7 @@ def build_parser() -> argparse.ArgumentParser:
     speed.add_argument("--tokens", type=int, default=32,
                        help="tokens decoded per cell (the warm window drops the first quarter)")
 
-    gpu = sub.add_parser("gpu", help="the same cells from the llama.cpp GPU build")
+    gpu = add("gpu", "the same cells from the llama.cpp GPU build")
     gpu.add_argument("--gguf", required=True)
     gpu.add_argument("--contexts", default=",".join(str(v) for v in CONTEXTS))
     gpu.add_argument("--loops", default=",".join(str(v) for v in LOOPS))
@@ -998,9 +1138,9 @@ def build_parser() -> argparse.ArgumentParser:
     gpu.add_argument("--port", type=int, default=49562)
     gpu.add_argument("--llama-server", default=None)
 
-    sub.add_parser("energy-plan", help="the powermetrics commands the owner runs")
+    add("energy-plan", "the powermetrics commands the owner runs")
 
-    energy = sub.add_parser("energy", help="record a powermetrics run")
+    energy = add("energy", "record a powermetrics run")
     energy.add_argument("--build", required=True, choices=("ane", "gpu"))
     energy.add_argument("--log", required=True)
     energy.add_argument("--tokens", type=int, required=True)
@@ -1011,7 +1151,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, help_text in (("report", "render the report page"),
                             ("check", "render, but do not write")):
-        command = sub.add_parser(name, help=help_text)
+        command = add(name, help_text)
         command.add_argument("--out", default=str(REPORT_PATH))
         command.add_argument("--energy-pending", action="store_true",
                              help="render with the energy row marked as the owner's "
@@ -1023,115 +1163,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     results_path = Path(args.results)
     results = load_results(results_path)
-    command = args.command
-
-    if command == "plan":
-        missing = missing_cells(results, energy_pending=False)
-        print(f"sweep store: {results_path} ({len(results['cells'])} cells measured)")
-        print(f"shipping configuration: {choose_shipping(results) or 'undecided'}")
-        required = [need for need in required_cells(results) if need.key != "shipping"]
-        print(f"required measurements: {len(required)}, missing: {len(missing)}")
-        if missing:
-            print("")
-            _print_missing(missing)
-        return 0
-
-    if command == "sizes":
-        value = measure_sizes(args.model_dir, args.config)
-        record(results, size_key(args.config), value,
-               command=" ".join(sys.argv[1:]),
-               artifacts=[Path(args.model_dir) / "meta.yaml"])
-        results["configs"].setdefault(args.config, {}).update(
-            {"lut_blocks": value["lut_blocks"], "lut_lm_head": value["lut_lm_head"],
-             "model_dir": value["model_dir"], "context_length": value["context_length"]})
-        save_results(results, results_path)
-        print(json.dumps(value, indent=2))
-        return 0
-
-    if command == "score":
-        candidate = (Path(args.candidate) if args.candidate
-                     else Path(args.results).parent / f"cand-{args.config}-loop{args.loops}.npz")
-        if args.candidate is None:
-            argv_ = dory_chat_score_command(
-                args.model_dir, candidate, loops=args.loops, chunk_size=args.chunk_size,
-                max_windows=args.max_windows, tokens_file=args.tokens_file)
-            print("running: " + " ".join(argv_))
-            completed = subprocess.run(argv_, capture_output=True, text=True)
-            if completed.returncode != 0:
-                print(completed.stdout[-2000:])
-                print(completed.stderr[-2000:], file=sys.stderr)
-                raise SystemExit(f"dory_chat score failed (rc {completed.returncode})")
-        value = score_candidate(args.reference, candidate)
-        value.update({"reference": str(args.reference), "candidate": str(candidate),
-                      "config": args.config, "loops": int(args.loops)})
-        record(results, kld_key(args.config, args.loops), value,
-               command=" ".join(sys.argv[1:]),
-               artifacts=[args.reference, candidate])
-        save_results(results, results_path)
-        print(json.dumps(value, indent=2))
-        return 0
-
-    if command == "speed":
-        values = measure_speed(args.model_dir, args.config, _parse_ints(args.contexts),
-                               _parse_ints(args.loops), tokens=args.tokens)
-        for key, value in values.items():
-            record(results, key, value, command=" ".join(sys.argv[1:]),
-                   artifacts=[Path(args.model_dir) / "meta.yaml"])
-        save_results(results, results_path)
-        print(json.dumps(values, indent=2))
-        return 0
-
-    if command == "gpu":
-        values = measure_gpu(args.gguf, _parse_ints(args.contexts), _parse_ints(args.loops),
-                             tokens=args.tokens, port=args.port,
-                             llama_server=args.llama_server)
-        for key, value in values.items():
-            record(results, key, value, command=" ".join(sys.argv[1:]),
-                   artifacts=[args.gguf])
-        save_results(results, results_path)
-        print(json.dumps(values, indent=2))
-        return 0
-
-    if command == "energy-plan":
-        chosen = choose_shipping(results)
-        if chosen is None:
-            print("# The shipping configuration is not chosen yet: the quality and")
-            print("# gate-speed cells decide it.  The command below works for whichever")
-            print("# configuration wins.")
-            print("")
-            chosen = "<shipping config>"
-        print(energy_plan(chosen))
-        return 0
-
-    if command == "energy":
-        config = args.config or (choose_shipping(results) if args.build == "ane"
-                                 else GPU_CONFIG) or CONFIG_NAMES[-1]
-        value = energy_from_log(args.log, args.build, args.tokens, args.seconds)
-        record(results, energy_key(args.build, config, args.context, args.loops), value,
-               command=" ".join(sys.argv[1:]), artifacts=[args.log])
-        save_results(results, results_path)
-        print(json.dumps(value, indent=2))
-        return 0
-
-    if command in ("report", "check"):
-        try:
-            table = render_markdown(results, energy_pending=args.energy_pending)
-        except SweepIncomplete as incomplete:
-            _print_missing(incomplete.missing)
-            return 2
-        if choose_shipping(results) is None:
-            print(table)
-            print("The sweep is complete but NO configuration meets every gate; "
-                  "nothing is shipped.", file=sys.stderr)
-            return 3
-        if command == "check":
-            print(table)
-            return 0
-        written = write_report(results, Path(args.out), energy_pending=args.energy_pending)
-        print(f"wrote {written}")
-        return 0
-
-    raise SystemExit(f"unknown command {command}")
+    return args.func(args, results, results_path)
 
 
 if __name__ == "__main__":

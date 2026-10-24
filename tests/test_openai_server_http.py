@@ -296,7 +296,11 @@ def test_bad_requests_get_openai_shaped_errors():
         assert payload["error"]["message"]
         assert payload["error"]["type"]
     assert results[0][1]["error"]["code"] == "model_not_found"
-    assert results[1][1]["error"]["code"] == "invalid_json" or True
+    # a non-numeric temperature is a sampling error, not a malformed body:
+    # the server rejects it in the sampling layer with its own code
+    assert results[1][1]["error"]["code"] == "invalid_sampling"
+    assert results[2][1]["error"]["code"] == "missing_messages"
+    assert results[3][1]["error"]["code"] == "invalid_json"
 
 
 def test_options_is_answered_for_a_browser_style_client():

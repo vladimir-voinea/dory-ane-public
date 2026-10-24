@@ -31,23 +31,33 @@ def directory_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
-def spec_functions(package: Path):
-    """The functions the package declares; a plain mlprogram has one, "main"."""
+class PackageError(RuntimeError):
+    """A package that cannot be inspected.  That is an audit FAILURE.
+
+    It used to be swallowed and reported as "declares no functions", which
+    turned "this package will not load" into a disagreement about its contents --
+    a green audit on a package nothing can open.
+    """
+
+
+def _load_spec(package: Path):
     try:
         from coremltools.models.utils import load_spec
-        declared = list(load_spec(str(package)).description.functions)
-    except Exception:
-        return []
+        return load_spec(str(package))
+    except Exception as error:
+        raise PackageError(f"{package.name} will not load: "
+                           f"{type(error).__name__}: {error}") from error
+
+
+def spec_functions(package: Path):
+    """The functions the package declares; a plain mlprogram has one, "main"."""
+    declared = list(_load_spec(package).description.functions)
     return [f.name for f in declared] if declared else ["main"]
 
 
 def metadata_functions(package: Path):
-    try:
-        from coremltools.models.utils import load_spec
-        value = load_spec(str(package)).description.metadata.userDefined.get(
-            "com.anemll.functions", "")
-    except Exception:
-        return []
+    value = _load_spec(package).description.metadata.userDefined.get(
+        "com.anemll.functions", "")
     return [part for part in str(value).split(",") if part]
 
 
@@ -90,8 +100,14 @@ def main() -> int:
                 continue
             size = directory_bytes(package)
             diff = (size - predicted) / predicted
-            functions = spec_functions(package)
-            recorded = metadata_functions(package)
+            try:
+                functions = spec_functions(package)
+                recorded = metadata_functions(package)
+            except PackageError as error:
+                failures.append(f"{label}: {error}")
+                print(f"{label:30s} {size / 1024**2:7.0f} {predicted / 1024**2:9.0f} "
+                      f"{diff * 100:+6.1f}%  UNREADABLE: {error}")
+                continue
             problems = []
             if abs(diff) > TOLERANCE:
                 problems.append(f"{diff * 100:+.0f}% off the prediction")

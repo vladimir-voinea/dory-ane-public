@@ -357,9 +357,12 @@ def test_chatml_fallback_marks_reasoning_on_and_off():
     on = chat.render_template(chat.CHATML_FALLBACK, messages, reasoning=True)
     off = chat.render_template(chat.CHATML_FALLBACK, messages, reasoning=False)
     assert "<|im_start|>user\nhello<|im_end|>" in on
-    assert on.rstrip().endswith("")
-    assert "thinking" in on or "" in on
-    assert " thinking" not in off
+    # reasoning on leaves the assistant turn at the thinking cue ...
+    assert on.rstrip().endswith("thinking")
+    assert " thinking" in on
+    # ... and reasoning off does not write the cue at all
+    assert "thinking" not in off
+    assert off.rstrip().endswith("assistant")
 
 
 def test_chatml_fallback_carries_a_system_prompt():
