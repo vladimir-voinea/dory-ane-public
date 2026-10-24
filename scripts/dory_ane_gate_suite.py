@@ -20,7 +20,8 @@ import numpy as np
 import torch
 
 from anemll.eval import load_eval_set, write_candidate
-from anemll.eval.kld import LogprobSource, read_candidate_npz, read_llama_cpp_kld, score_sources
+from anemll.eval.kld import (LogprobSource, array_source, read_candidate_npz,
+                             read_llama_cpp_kld, score_sources)
 from anemll.models.dory_ane_model import DoryANEConfig, DoryANEForCausalLM
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,10 +43,14 @@ def gate_rows(mode, window):
 
 
 def run_prefill_gate(model, evalset, rows_spec, batch):
-    """Prefill in fixed batches; keep log-probabilities only for the gate rows."""
-    rows, positions, logprobs = 0, [], []
-    t0 = time.time()
+    """Prefill in fixed batches; one part per scored context.
+
+    A part is scored and written as soon as its context finishes, so a machine
+    or disk failure costs one context, never the whole gate.
+    """
+    parts = []
     for chunk, first_row, n_rows in rows_spec:
+        t0 = time.time()
         base = chunk * evalset.chunk_size
         first_scored = evalset.first_scored
         want_start = first_scored + first_row
@@ -72,20 +77,20 @@ def run_prefill_gate(model, evalset, rows_spec, batch):
                     out.append(keep_row(lg[0, i]))
             pos += take
             if (pos // take) % 16 == 0:
-                print(f"    prefill {pos}/{len(ids)} tokens, {time.time() - t0:.0f}s",
-                      flush=True)
-        out = np.stack(out)
-        rows += out.shape[0]
-        logprobs.append(out)
-        positions.append(evalset.scored_positions()[chunk * evalset.rows_per_chunk + first_row:
-                                                   chunk * evalset.rows_per_chunk + first_row + n_rows])
-    return np.concatenate(logprobs), np.concatenate(positions), rows, time.time() - t0
+                print(f"    chunk {chunk} prefill {pos}/{len(ids)} tokens, "
+                      f"{time.time() - t0:.0f}s", flush=True)
+        positions = evalset.scored_positions()[chunk * evalset.rows_per_chunk + first_row:
+                                               chunk * evalset.rows_per_chunk + first_row + n_rows]
+        parts.append({"chunk": chunk, "logprobs": np.stack(out), "positions": positions,
+                      "wall_s": time.time() - t0})
+    return parts
 
 
 def run_decode_gate(model, evalset, rows_spec):
-    rows, positions, logprobs = 0, [], []
-    t0 = time.time()
+    """One token per step; one part per scored context."""
+    parts = []
     for chunk, first_row, n_rows in rows_spec:
+        t0 = time.time()
         base = chunk * evalset.chunk_size
         first_scored = evalset.first_scored
         limit = first_scored + first_row + n_rows
@@ -97,13 +102,13 @@ def run_decode_gate(model, evalset, rows_spec):
             if pos >= first_scored + first_row:
                 out.append(keep_row(lg[0, 0]))
             if pos and pos % 256 == 0:
-                print(f"    decode {pos}/{len(ids)} tokens, {time.time() - t0:.0f}s", flush=True)
-        out = np.stack(out)
-        rows += n_rows
-        logprobs.append(out)
-        positions.append(evalset.scored_positions()[chunk * evalset.rows_per_chunk + first_row:
-                                                   chunk * evalset.rows_per_chunk + first_row + n_rows])
-    return np.concatenate(logprobs), np.concatenate(positions), rows, time.time() - t0
+                print(f"    chunk {chunk} decode {pos}/{len(ids)} tokens, "
+                      f"{time.time() - t0:.0f}s", flush=True)
+        positions = evalset.scored_positions()[chunk * evalset.rows_per_chunk + first_row:
+                                               chunk * evalset.rows_per_chunk + first_row + n_rows]
+        parts.append({"chunk": chunk, "logprobs": np.stack(out), "positions": positions,
+                      "wall_s": time.time() - t0})
+    return parts
 
 
 def keep_row(logits_row):
@@ -111,9 +116,15 @@ def keep_row(logits_row):
     return log_softmax(logits_row).astype(np.float16)
 
 
-def score(logprobs, positions, tokens, ref_path, name, out_dir):
+def score(logprobs, positions, tokens, ref_path, name, out_dir, save_candidate=False):
+    """Score in memory: the candidate never touches the disk unless asked.
+
+    A 4,094-row candidate is 1.07 GB of npz and this machine shares its disk
+    with three other agents; a transient full disk killed a completed prefill
+    gate once.  array_source wraps the array without copying, so the scorer
+    streams it exactly like it streams the reference.
+    """
     ref = read_llama_cpp_kld(ref_path)
-    # slice the reference to exactly the rows the candidate produced
     want = positions
     idx = np.searchsorted(ref.positions, want)
     if idx.size == 0 or not np.array_equal(ref.positions[idx], want):
@@ -124,11 +135,15 @@ def score(logprobs, positions, tokens, ref_path, name, out_dir):
     sliced = LogprobSource(f"{ref.name}[{start}:{stop}]", len(want), ref.vocab_size,
                            ref.tokens, ref.positions[start:stop], ref.meta,
                            lambda a, b: ref.logp_block(start + a, start + b))
-    cand_path = os.path.join(out_dir, f"cand_{name}.npz")
-    write_candidate(cand_path, logprobs, positions, tokens,
-                    meta={"model": "dory-ane-fp16", "kv_mode": "last_loop", "gate": name},
-                    dtype="float16")
-    cand = read_candidate_npz(cand_path)
+    if save_candidate:
+        cand_path = os.path.join(out_dir, f"cand_{name}.npz")
+        write_candidate(cand_path, logprobs, positions, tokens,
+                        meta={"model": "dory-ane-fp16", "kv_mode": "last_loop", "gate": name},
+                        dtype="float16")
+        cand = read_candidate_npz(cand_path)
+    else:
+        cand = array_source(logprobs, tokens=tokens, positions=positions,
+                            name=f"{name}_candidate", meta={"gate": name})
     return score_sources(sliced, cand)
 
 
@@ -142,6 +157,8 @@ def main(argv=None):
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--gates", default="prefill2,prefill1,prefill4,decode2,decode1,decode4")
     ap.add_argument("--out-json", default=os.path.join(ARTIFACTS, "gate_suite.json"))
+    ap.add_argument("--save-candidates", action="store_true",
+                    help="also write the candidate npz (1 GB each; off by default)")
     ap.add_argument("--artifacts", default=ARTIFACTS)
     args = ap.parse_args(argv)
 
@@ -172,28 +189,37 @@ def main(argv=None):
         print(f"[{time.strftime('%H:%M:%S')}] gate {name} rows_mode={mode} "
               f"threads={args.threads} loadavg={loadavg():.0f}", flush=True)
         if kind == "prefill":
-            lp, pos, n, secs = run_prefill_gate(model, evalset, this_spec, args.batch)
+            parts = run_prefill_gate(model, evalset, this_spec, args.batch)
         else:
-            lp, pos, n, secs = run_decode_gate(model, evalset, this_spec)
+            parts = run_decode_gate(model, evalset, this_spec)
         ref_name = (f"bf16_decode_loop{loops}_batch{args.batch if kind == 'prefill' else 1}.kld")
         ref_path = os.path.join(REFS, ref_name)
-        entry = {"gate": name, "kind": kind, "loops": loops, "rows": int(n),
-                 "row_range": f"{int(pos[0])}..{int(pos[-1])}", "wall_s": round(secs, 1),
-                 "loadavg": round(loadavg(), 1), "reference": ref_name,
-                 "threads": args.threads, "rows_mode": mode}
-        if os.path.exists(ref_path):
-            res = score(lp, pos, tokens, ref_path, name, args.artifacts)
-            entry.update({"mean_kld": res.mean_kld, "top1": res.top1_agreement,
-                          "kld_max": res.kld_max, "kld_p90": res.kld_p90})
-            print(f"[{time.strftime('%H:%M:%S')}] {name}: rows={n} {entry['row_range']} "
-                  f"mean_kld={res.mean_kld:.5f} top1={100 * res.top1_agreement:.2f}% "
-                  f"({secs:.0f}s, loadavg {entry['loadavg']:.0f})", flush=True)
-        else:
-            entry["skipped"] = f"missing reference {ref_name}"
-            print(f"[{time.strftime('%H:%M:%S')}] {name}: {entry['skipped']}", flush=True)
-        results.append(entry)
-        with open(args.out_json, "w") as fh:
-            json.dump(results, fh, indent=2)
+        for part in parts:
+            lp, pos = part["logprobs"], part["positions"]
+            n = int(pos.size)
+            entry = {"gate": name, "kind": kind, "loops": loops, "rows": n,
+                     "chunk": part["chunk"],
+                     "row_range": f"{int(pos[0])}..{int(pos[-1])}",
+                     "wall_s": round(part["wall_s"], 1),
+                     "loadavg": round(loadavg(), 1), "reference": ref_name,
+                     "threads": args.threads, "rows_mode": mode,
+                     "finite": bool(np.isfinite(lp).all())}
+            if os.path.exists(ref_path):
+                res = score(lp, pos, tokens, ref_path, name, args.artifacts,
+                            save_candidate=args.save_candidates)
+                entry.update({"mean_kld": res.mean_kld, "top1": res.top1_agreement,
+                              "kld_max": res.kld_max, "kld_p90": res.kld_p90})
+                print(f"[{time.strftime('%H:%M:%S')}] {name} chunk{part['chunk']} "
+                      f"{entry['row_range']}: rows={n} mean_kld={res.mean_kld:.5f} "
+                      f"top1={100 * res.top1_agreement:.2f}% max={res.kld_max:.3f} "
+                      f"({entry['wall_s']}s, loadavg {entry['loadavg']:.0f}, "
+                      f"finite={entry['finite']})", flush=True)
+            else:
+                entry["skipped"] = f"missing reference {ref_name}"
+                print(f"[{time.strftime('%H:%M:%S')}] {name}: {entry['skipped']}", flush=True)
+            results.append(entry)
+            with open(args.out_json, "w") as fh:
+                json.dump(results, fh, indent=2)
     return 0
 
 
