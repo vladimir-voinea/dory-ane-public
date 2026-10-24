@@ -10,7 +10,7 @@ independent limits, both measured here:
 **1. A single state may not exceed ~24 MiB.** 32 MiB and 36 MiB fail to build an
 execution plan (`error code: -14`) at load; 24 MiB and below load and predict.
 
-**2. The number of states is capped somewhere between 36 and 63.** This is the
+**2. The number of states is capped between 56 and 63.** This is the
 non-obvious one. 63 states of 1.0 MiB (63 MiB total) **fail**, while 36 states of
 24.0 MiB (864 MiB total) **load and predict**. Total resident bytes are therefore *not*
 the binding constraint, at least up to 864 MiB — the count is.
@@ -45,9 +45,14 @@ matter how small the individual states are. The correct design target is therefo
 **as few carriers as the per-state size limit allows**, not as many as possible:
 
 ```
-per-state budget: 24 MiB          -> a 135 MiB sliding cache needs >= 6 carriers
-state-count budget: < 63 (>= 36)  -> a 864 MiB full cache as 36 per-(layer,head) states fits
+per-state budget: 24 MiB           -> a 135 MiB sliding cache needs >= 6 carriers
+state-count budget: 56 ok, 63 not  -> a 864 MiB full cache as 36 per-(layer,head) states fits,
+                                      42 carriers carrying 999 MiB loads and predicts
 ```
+
+The two limits were found in **opposite directions**: four times more bytes in one third
+of the carriers is fine, and one third of the bytes in twice the carriers is not. A
+reader who takes away only "keep states small" would draw exactly the wrong conclusion.
 
 ## How to reproduce
 
