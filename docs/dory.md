@@ -98,6 +98,31 @@ silently gives each chunk its own state and the input block's cache writes never
 reach the recurrent block -- a correctness bug with no error message.  The trick
 is Gemma 3's (`gemma3_converter.py:341-371`, `:1474-1481`).
 
+### The Core ML cache must be writable (what error -14 usually means)
+
+Loading a .mlpackage makes Core ML compile it and cache the result under
+~/Library/Caches/com.apple.CoreML.  When that write is denied - a sandboxed
+shell, a restricted container, a read-only home - Core ML does not say so.  It
+reports
+
+    Failed to build the model execution plan using a model architecture file
+    (model.mil) with error code: -14
+
+which reads like a broken package or an unsupported graph.  It is a permission
+problem, and it is invisible in the artifacts: the same file loads fine from a
+shell that can write that directory.  Related trap: ct.models.MLModel(path)
+constructs lazily, so "the package loads" only proves it parsed.  The plan is
+built at predict() or make_state(), which is where -14 appears.
+
+Check before blaming the model:
+
+    mkdir -p ~/Library/Caches/com.apple.CoreML && touch ~/Library/Caches/com.apple.CoreML/.dory_probe
+
+If that fails, run the loader from a shell that can write there (or grant the
+process Full Disk Access).  anemll/dory_chat.py raises
+"Core ML cache not writable at <path>" with this explanation rather than
+letting Core ML -14 through.
+
 ## Running
 
     # chat, reasoning on by default, loop count chosen at start
@@ -178,6 +203,10 @@ Facts established while building it (worth knowing before the first real run):
   records and uses a documented ChatML fallback with an open think block.
 
 ## Gate commands (run when the machine is quiet)
+
+Run these from a shell where the Core ML cache above is writable: in a
+sandboxed shell every load reports -14 for reasons that have nothing to do
+with the packages.
 
     # 0. reference: 1K-window decode mode at 2 loops (BF16 GGUF, one token per
     #    step would be batch 1; the Core ML pipeline prefills in 64-token
