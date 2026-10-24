@@ -90,11 +90,16 @@ prints it as one line and exits 2 — never a traceback, never silent truncation
 ## Gate commands (heavy: run in an exclusive window)
 
 ```bash
-# 1. placement at 24,576 rows, one chunk, the decision point for the tiles
-python scripts/convert_dory.py --model <bf16> --output <out> --context-length 24576 \
-    --only input [--full-tile-rows 16384,8192]
+# 1. the D7 decision: one 24,576-row cache or the 16,384 + 8,192 tiles.
+#    Latency evidence (CPU_ONLY vs CPU_AND_NE) plus the raw compute plan; the
+#    probe retries in fresh processes because this host's stateful path is flaky.
+python scripts/dory_24k_placement_probe.py --model <bf16> --out <out>/probe-24k.json
+python scripts/dory_24k_placement_probe.py --model <bf16> \
+    --full-tile-rows 16384,8192 --out <out>/probe-24k-tiled.json
+
+# 1b. what the conversion would do, and what it would cost (no ANE, no writes)
 python -m anemll.ane_converter.dory_converter --model <bf16> --output <out> \
-    --context-length 24576 --dry-run
+    --context-length 24576 --full-tile-rows 16384,8192 --dry-run
 
 # 2. the six-code recall gate at 2 loops
 python scripts/dory_recall.py --backend coreml --model-dir <out> --context 24576 \
@@ -109,7 +114,7 @@ python -m anemll.dory_chat bench --model-dir <out> --context 24576 --loops 2 \
 
 | gate | threshold | measured |
 |---|---|---|
-| every op of every chunk on the ANE at 24,576 rows (or with the tiles) | GPU 0, CPU 0 | *pending the exclusive window* |
+| the 24,576-row cache (or the tiles) keeps the ANE: latency evidence, CPU_ONLY vs CPU_AND_NE on one chunk | CPU_AND_NE materially faster (ratio >= 1.5), raw plan attached | *pending the exclusive window* |
 | six codes at depths 0..24K, 2 loops | all six | *pending* |
 | decode-mode KLD on windows beyond 16K, 2 loops | mean KLD <= 0.05, top-1 >= 93 % | *pending* |
 | decode at 24K, 2 loops | >= 8 tok/s (below 6: stop and report) | *pending* |
@@ -129,6 +134,39 @@ python -m anemll.dory_chat bench --model-dir <out> --context 24576 --loops 2 \
   machine is doing; the benchmark reports the process's peak RSS.
 
 
+## What "placement" means on this host (2026-10-24 17:05)
+
+An op-by-op placement number **cannot be measured here** and is therefore no
+longer a gate:
+
+* `MLComputePlan` attributes **every operation to `other`** on macOS 27.2 with
+  coremltools 8.3.  DANE-5's stateless control, a printout of the tool's own
+  output, reads `ane 0, gpu 0, cpu 0, other 8` -- a plan that assigns nothing.
+* It cannot build a plan for a **stateful** model at all, and every Dory component
+  is stateful.  So a placement percentage would be a number this toolchain
+  invented, not one it measured.
+
+The evidence the toolchain can produce is a **latency pair**: the same converted
+chunk with `ComputeUnit.CPU_ONLY` and with `ComputeUnit.CPU_AND_NE`, timed after
+warmup on one state object.  A graph whose work runs on the ANE is materially
+faster with it enabled; a graph that does not gets the same number twice.  The
+probe reports both medians, their ratio, a 1.5 threshold stated next to the
+numbers, and the plan's raw lines verbatim so a reader can disagree with the tool.
+It never prints a placement share.
+
+The stateful path is also **intermittent**: the same package loads and predicts in
+one fresh process and returns `error code: -14` in others, minutes apart, at load
+11 and at load 340 alike.  Every heavy step therefore runs in a **fresh process**
+with up to ten attempts; the artifact records how many it took, each attempt's
+error text, and the load average and swap at every attempt.  A run that never
+completed reports `inconclusive`, never a pass.
+
+One consequence worth stating plainly: the converter's own gate,
+`assert_ane_only`, fails when the plan attributes no ANE operation to any op --
+which is exactly what this host returns for every model.  A 24K conversion here
+needs `--no-placement-check`, and the latency pair above is what stands in its
+place.  That is a policy decision, recorded rather than papered over.
+
 ## Status of the placement evidence (2026-10-24 07:10)
 
 The 24K placement probe (`scripts/dory_24k_placement_probe.py`: seven blocks, one
@@ -147,7 +185,7 @@ builds the execution plan**, which is DANE-5's BLOCKER B and is *not* specific t
 | the 7-block probe, the 16,384 + 8,192 tiles | 24,576 | `-14` |
 
 So the tiles-vs-one-cache question is **open, and it is the machine, not the
-model**.  The remedy DANE-5 identified is a reboot (it also clears the swap the
-other session left); the probe takes about two minutes per variant afterwards and
-is the first thing to run in an exclusive window.
-
+model** -- and, from the later evidence above, it is also the *toolchain*.  The
+probe takes about two minutes per variant once the machine is quiet, retries in a
+fresh process so one `-14` is not the answer, and is still the first thing to run
+in an exclusive window.
