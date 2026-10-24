@@ -26,7 +26,12 @@ loops 4: 0.003490 / 97.31 %, 0.002581 / 97.56 %
 | DANE-8 | not started | blocked on DANE-6/7 |
 
 ## Environment facts that matter
-- **The Mac is shared with another agent session** (BeamReach: Xcode swift tests + 300-1100 simulator processes). Load has oscillated between 9 and 1016; swap went to 41/42 GB. Whenever that session runs, our work crawls and stateful Core ML loads intermittently fail with error -14. Remedy is an exclusive window, not code.
+- **The machine was shared with a concurrent, unrelated build session.** Load oscillated
+  between 9 and 1016 and swap reached 41/42 GB. That is why several long conversions were
+  restarted rather than finished, and why the ANE gates were run only in exclusive windows.
+  It was *not* the cause of the -14 loading failures: those turned out to be (a) a sandboxed
+  shell unable to write the Core ML cache and (b) a per-state size ceiling. See
+  findings/ane-state-ceiling.md.
 - coremltools 8.3 on this OS build: `save_multifunction` yields packages that either fail to load (no Manifest.json) or silently keep only the default function; hence one package per function (DANE-5 pivot, committed).
 - Sub-session file policy is workspace-write on `/Users/vladimir/dev/dory-ane`: teammates cannot write worktrees/artifacts, so the Lead applies their patches and commits (`dane5-out/`, `.dane2-followon/`).
 - Disk: ~25 GB free. DANE-3's superseded references were deleted (freed 8 GB); its kept candidates are in `artifacts/DANE-3/kept-candidates/`.
