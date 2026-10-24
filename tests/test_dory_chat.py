@@ -247,7 +247,12 @@ class ScriptedRuntime:
     def reset_state(self):
         self.resets += 1
 
-    def prefill(self, ids, start=0):
+    def check_context(self, prompt_tokens, reserve=1):
+        chat.DoryRuntime.check_context(self, prompt_tokens, reserve=reserve)
+
+    def prefill(self, ids, start=0, progress=None):
+        if progress is not None:
+            progress(len(ids), len(ids), 0.0)
         return np.zeros((len(ids), VOCAB), dtype=np.float32)
 
     def decode(self, token, pos):

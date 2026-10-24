@@ -35,7 +35,25 @@ import torch
 from anemll.ane_converter.dory_converter import read_meta
 from anemll.utils import dory_caches as dc
 
-__all__ = ["DoryRuntime", "ChatTokenizer", "main", "build_parser"]
+class ContextOverflowError(ValueError):
+    """A prompt (plus the room generation needs) does not fit the context.
+
+    Its own class so the CLI can turn it into one clear line and exit code 2:
+    the ticket asks for a clear error, not a crash and not silent truncation.
+    """
+
+    def __init__(self, message: str, *, used: int = 0, context: int = 0):
+        super().__init__(message)
+        self.used = int(used)
+        self.context = int(context)
+
+
+def format_tokens(count: int) -> str:
+    return f"{count:,}"
+
+
+__all__ = ["ContextOverflowError", "DoryRuntime", "ChatTokenizer", "main",
+           "build_parser"]
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +161,38 @@ class DoryRuntime:
             self.params["sliding_rows"], self.params["sliding_window"],
             dtype=torch.float16).numpy()
 
+    def _write_inputs(self, entry: dict, start: int, q_len: int) -> dict:
+        """The per-tile write index and gate a tiled conversion asks for.
+
+        Mirrors DoryANEForCausalLM.tile_write_inputs: the host owns the decision
+        (which full-attention tile owns these rows), the graph only lerps.  A
+        batch that straddles a tile boundary is refused, because one write per
+        tile cannot express it.
+        """
+        names = entry["inputs"]
+        if "write_index_1" not in names:
+            return {}
+        tiles = self.params.get("full_cache_tiles") or [int(self.params["context_length"])]
+        offsets, start_pos = [], 0
+        for rows in tiles:
+            offsets.append(start_pos)
+            start_pos += int(rows)
+        end = int(start) + int(q_len)
+        owners = [(offset, int(rows)) for offset, rows in zip(offsets, tiles)
+                  if int(start) >= offset and end <= offset + int(rows)]
+        if not owners:
+            raise ContextOverflowError(
+                f"a {q_len}-token batch at {start} straddles the full-attention tile "
+                f"boundary {tuple(tiles)}; the tiled path writes one tile per call")
+        owner = owners[0]
+        out = {}
+        for tile, (offset, rows) in enumerate(zip(offsets, tiles), start=1):
+            inside = 1.0 if (offset, int(rows)) == owner else 0.0
+            index = (int(start) - owner[0]) if inside else 0
+            out[f"write_index_{tile}"] = np.array([index], dtype=np.int32)
+            out[f"write_gate_{tile}"] = np.array([inside], dtype=np.float16)
+        return out
+
     def _predict(self, name: str, inputs: dict, function: str) -> dict:
         started = time.time()
         out = self.models[name][function].predict(inputs, state=self._state)
@@ -150,7 +200,7 @@ class DoryRuntime:
         self.predict_calls += 1
         return out
 
-    def _blocks(self, hidden, start, q_len):
+    def _blocks(self, hidden, start, q_len, progress=None):
         """Run every block component in run order, looping the recurrent ones."""
         mask = self.build_mask(start, q_len)
         pos = np.array([start], dtype=np.int32)
@@ -173,15 +223,19 @@ class DoryRuntime:
                     for name in group:
                         inputs = {"hidden_states": hidden, "causal_mask": mask,
                                   "current_pos": pos, "cache_pos": cache_pos}
+                        inputs.update(self._write_inputs(self.meta["components"][name],
+                                                         start, q_len))
                         if self.meta["components"][name]["loop_entry"]:
                             inputs["h_in"] = h_in
                         hidden = self._predict(name, inputs, function)["output_hidden_states"]
                 continue
             inputs = {"hidden_states": hidden, "causal_mask": mask,
                       "current_pos": pos, "cache_pos": cache_pos}
+            inputs.update(self._write_inputs(entry, start, q_len))
             hidden = self._predict(order[index], inputs, function)["output_hidden_states"]
             index += 1
         return hidden
+
 
     def embeddings(self, input_ids) -> np.ndarray:
         ids = np.asarray(input_ids, dtype=np.int32).reshape(1, -1)
@@ -216,25 +270,64 @@ class DoryRuntime:
         hidden = self._blocks(hidden, start, len(input_ids))
         return self.lm_head(hidden)[0]
 
-    def prefill(self, input_ids, start: int = 0):
-        """Feed a prompt; returns the log-probability rows for every fed position."""
-        ids = list(int(t) for t in np.asarray(input_ids).reshape(-1))
-        batch = int(self.params["batch_size"])
-        pos = int(start)
+    def check_context(self, prompt_tokens: int, reserve: int = 1) -> None:
+        """Refuse a prompt that cannot fit, before any work is done.
+
+        The context is the number of positions the caches hold; one position per
+        generated token is used as the loop above advances, so the room left for
+        generation is context - prompt_tokens.  The message names the numbers and
+        the way out rather than letting a slice run off the end of a cache.
+        """
+        context = int(self.params["context_length"])
+        used = int(prompt_tokens) + int(reserve)
+        if used > context:
+            raise ContextOverflowError(
+                f"the prompt is {format_tokens(prompt_tokens)} tokens and this model's "
+                f"context is {format_tokens(context)} tokens: "
+                f"{format_tokens(max(used - context, 0))} token(s) too long. Shorten the "
+                f"prompt (or lower --max-tokens), or convert a model with a larger "
+                f"--context-length; the prompt is not truncated silently.",
+                used=int(prompt_tokens), context=context)
+
+    def prefill(self, input_ids, start: int = 0, progress=None):
+        """Feed a prompt in 64-token batches; returns logits for every position.
+
+        A 24K prompt is 384 predicts per loop pass, so the caller gets a progress
+        callback every few batches: a long prefill must never look hung (spec
+        user story 12).  The tail shorter than one batch goes through the
+        one-token function, which is the only path the traced graphs provide.
+        """
+        ids = [int(t) for t in np.asarray(input_ids).reshape(-1)]
+        self.check_context(start + len(ids))
+        batch = int(self.params["batch_size"] or 1)
+        total = max(len(ids), 1)
+        step = max(1, min(16, total // 8 or 1))
         rows = []
-        while len(ids) - pos + start >= batch:
-            piece = ids[pos - start: pos - start + batch]
-            rows.append(self.forward(piece, pos))
-            pos += batch
-        while pos < start + len(ids):
-            rows.append(self.forward([ids[pos - start]], pos))
-            pos += 1
+        started = time.time()
+        done = 0
+        while done + batch <= len(ids):
+            rows.append(self.forward(ids[done:done + batch], start + done))
+            done += batch
+            if progress is not None and (done % step == 0 or done == len(ids)):
+                progress(done, len(ids), time.time() - started)
+        while done < len(ids):
+            rows.append(self.forward([ids[done]], start + done))
+            done += 1
+            if progress is not None:
+                progress(done, len(ids), time.time() - started)
         if not rows:
             return np.zeros((0, self.params["vocab_size"]), dtype=np.float32)
         return np.concatenate(rows, axis=0)
 
     def decode(self, token_id: int, pos: int) -> np.ndarray:
+        context = int(self.params["context_length"])
+        if pos >= context:
+            raise ContextOverflowError(
+                f"the context is full: position {format_tokens(pos)} of "
+                f"{format_tokens(context)}. Stop generating or raise --context-length.",
+                used=pos, context=context)
         return self.forward([int(token_id)], pos)[0]
+
 
     # -- helpers -----------------------------------------------------------
     def stats(self) -> dict:
@@ -385,17 +478,18 @@ class StreamPrinter:
 
 
 def generate(runtime, tokenizer, prompt, max_tokens=256, temperature=0.0, top_p=1.0,
-             reasoning=True, system=None, stream=True, out=sys.stdout):
+             reasoning=True, system=None, stream=True, out=sys.stdout,
+             progress=True):
     """Prefill the prompt, then stream tokens until EOS or max_tokens."""
     text = tokenizer.apply_chat_template(build_messages(prompt, system), reasoning=reasoning)
     prompt_ids = tokenizer.encode(text)
     context = int(runtime.params["context_length"])
-    if len(prompt_ids) >= context - 1:
-        raise ValueError(f"the prompt is {len(prompt_ids)} tokens, the converted "
-                         f"context is {context}")
+    runtime.check_context(len(prompt_ids), reserve=1)
     runtime.reset_state()
     started = time.time()
-    logits = runtime.prefill(prompt_ids, 0)
+    long_prompt = len(prompt_ids) > 2 * int(runtime.params.get("batch_size") or 64)
+    printer_progress = _progress_printer() if (progress and long_prompt) else None
+    logits = runtime.prefill(prompt_ids, 0, progress=printer_progress)
     prefill_seconds = time.time() - started
     generated = []
     printer = StreamPrinter(tokenizer, out) if stream else None
@@ -441,7 +535,7 @@ def run_session(args) -> int:
 def _answer_once(args, runtime, tokenizer) -> int:
     result = generate(runtime, tokenizer, args.prompt, args.max_tokens,
                       args.temperature, args.top_p, not args.no_think,
-                      args.system, args.stream)
+                      args.system, args.stream, getattr(args, "progress", True))
     print(json.dumps({k: v for k, v in result.items() if k != "text"}, indent=2),
           file=sys.stderr)
     return 0
@@ -479,13 +573,33 @@ def _converse(args, runtime, tokenizer) -> int:
                 print(f"loop count already {wanted}; cache kept", file=sys.stderr)
             continue
         print("dory> ", end="", flush=True)
-        generate(runtime, tokenizer, line, args.max_tokens, args.temperature,
-                 args.top_p, not args.no_think, args.system, args.stream)
+        try:
+            generate(runtime, tokenizer, line, args.max_tokens, args.temperature,
+                     args.top_p, not args.no_think, args.system, args.stream,
+                     getattr(args, "progress", True))
+        except ContextOverflowError as error:
+            print(f"error: {error}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # Benchmarks and scoring
 # ---------------------------------------------------------------------------
+
+def _progress_printer(out=sys.stderr):
+    """A prefill progress line: batch count, percentage and tok/s so far."""
+    state = {"last": 0.0}
+
+    def report(done: int, total: int, elapsed: float) -> None:
+        now = time.time()
+        if done < total and now - state["last"] < 0.25:
+            return
+        state["last"] = now
+        rate = done / elapsed if elapsed > 0 else 0.0
+        print(f"\rprefill {done:,}/{total:,} tokens ({100.0 * done / max(total, 1):.0f}%, "
+              f"{rate:,.0f} tok/s)", end="" if done < total else "\n", file=out, flush=True)
+
+    return report
+
 
 def _uptime() -> dict:
     try:
@@ -511,23 +625,49 @@ def filler_tokens(context: int, tokenizer=None, text=None) -> np.ndarray:
     return ids[:context].astype(np.int32)
 
 
+def resident_memory() -> dict:
+    """Peak resident set size of this process, in bytes, plus the machine's swap.
+
+    ps and vmmap are not reachable from a sandboxed session, so the process
+    measures itself: ru_maxrss is the peak RSS in bytes on macOS, which is the
+    number the ticket asks for (the model's own weights and states dominate it).
+    """
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    machine = {}
+    try:
+        import subprocess
+        out = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True,
+                             text=True).stdout.strip()
+        machine["swap"] = out
+    except Exception:
+        pass
+    return {"peak_rss_bytes": int(peak), "peak_rss_gib": round(peak / 1024 ** 3, 2),
+            "machine": machine}
+
+
 def benchmark(args) -> int:
     """Decode tok/s at a chosen context, for one or more loop counts."""
     runtime = DoryRuntime(args.model_dir, verbose=args.verbose)
     tokenizer = ChatTokenizer(Path(args.model_dir), runtime.meta)
     context = int(args.context)
+    if context > int(runtime.params["context_length"]):
+        raise ContextOverflowError(
+            f"--context {format_tokens(context)} is beyond the converted context "
+            f"{format_tokens(int(runtime.params['context_length']))}")
     prompt = filler_tokens(context, tokenizer, args.filler_text)
+    printer = _progress_printer() if args.progress else None
     results = []
     for loops in [int(v) for v in str(args.loops).split(",")]:
         runtime.set_loops(loops)
         runtime.reset_state()
         started = time.time()
-        logits = runtime.prefill(prompt, 0)
+        logits = runtime.prefill(prompt, 0, progress=printer)
         prefill_seconds = time.time() - started
         window = []
         positions = [context]
         token = int(np.argmax(logits[-1]))
-        for step in range(int(args.tokens)):
+        for _ in range(int(args.tokens)):
             started = time.time()
             logits = runtime.decode(token, positions[-1])
             window.append(time.time() - started)
@@ -535,11 +675,15 @@ def benchmark(args) -> int:
             positions.append(positions[-1] + 1)
         warm = window[len(window) // 4:] or window
         mean = sum(warm) / len(warm)
-        results.append({"loops": loops, "context": context,
-                        "prefill_seconds": prefill_seconds,
-                        "decode_tok_s": 1.0 / mean, "decode_ms": mean * 1e3,
-                        "tokens": len(warm), "machine": _uptime()})
-        print(json.dumps(results[-1]), file=sys.stderr)
+        result = {"loops": loops, "context": context,
+                  "prompt_tokens": int(len(prompt)),
+                  "prefill_seconds": prefill_seconds,
+                  "prefill_tok_s": len(prompt) / max(prefill_seconds, 1e-9),
+                  "decode_tok_s": 1.0 / mean, "decode_ms": mean * 1e3,
+                  "tokens": len(warm), "resident": resident_memory(),
+                  "machine": _uptime()}
+        results.append(result)
+        print(json.dumps(result), file=sys.stderr)
     print(json.dumps(results, indent=2))
     return 0
 
@@ -628,6 +772,8 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--no-think", action="store_true", help="turn reasoning off")
     chat.add_argument("--no-stream", dest="stream", action="store_false")
     chat.add_argument("--verbose", action="store_true")
+    chat.add_argument("--no-progress", dest="progress", action="store_false",
+                      help="hide the prefill progress line")
     chat.set_defaults(func=run_session)
 
     bench = sub.add_parser("bench", help="decode tok/s at a context and loop counts")
@@ -637,6 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--tokens", type=int, default=32)
     bench.add_argument("--filler-text", default=None)
     bench.add_argument("--verbose", action="store_true")
+    bench.add_argument("--no-progress", dest="progress", action="store_false")
     bench.set_defaults(func=benchmark)
 
     sc = sub.add_parser("score", help="score this pipeline against a decode reference")
@@ -655,7 +802,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ContextOverflowError as error:
+        # one clear line, exit code 2: never a traceback, never silent truncation
+        print(f"error: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

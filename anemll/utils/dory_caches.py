@@ -205,6 +205,149 @@ def build_causal_mask(start: int, q_len: int, context_length: int, sliding_rows:
     ], dim=-1)
 
 
+# ---------------------------------------------------------------------------
+# The 24,576-row full-attention caches: one state, or two tiles (spec D7)
+# ---------------------------------------------------------------------------
+
+#: Spec D7's fallback for a full-attention cache that falls off the ANE at its
+#: full width: 16,384 + 8,192 rows, the two attention partials merged with a
+#: log-sum-exp combine.  16,384 is the documented ANE axis guidance, 8,192 the
+#: rest of a 24,576-token context.
+FULL_TILES_24K = (16384, 8192)
+
+
+def full_cache_tiles(context_length: int, tiles=None) -> tuple:
+    """Row counts of the full-attention cache tiles; they sum to the context.
+
+    tiles=None (or a single tile equal to the context) is the shipped shape: one
+    cache of context_length rows.  Two tiles are the spec's fallback.  Any other
+    layout is refused rather than silently approximated -- tiles that do not add
+    up to the context would lose tokens.
+    """
+    ctx = int(context_length)
+    if ctx <= 0:
+        raise ValueError("context_length must be positive")
+    if tiles is None:
+        return (ctx,)
+    if isinstance(tiles, int):
+        tiles = (tiles,)
+    rows = tuple(int(t) for t in tiles)
+    if len(rows) not in (1, 2):
+        raise ValueError(f"a full-attention cache is one cache or the spec's two "
+                         f"tiles, got {len(rows)} tiles {rows}")
+    if any(r <= 0 for r in rows):
+        raise ValueError(f"tile rows must be positive, got {rows}")
+    if sum(rows) != ctx:
+        raise ValueError(f"tiles {rows} sum to {sum(rows)}, not the context length "
+                         f"{ctx}: a layout that does not add up would drop tokens")
+    return rows
+
+
+def full_tile_offsets(tiles) -> tuple:
+    """Absolute position where each tile starts: (0, 16384) at 24,576 rows."""
+    offsets, start = [], 0
+    for rows in tiles:
+        offsets.append(start)
+        start += int(rows)
+    return tuple(offsets)
+
+
+def full_cache_shapes(context_length: int, num_kv_heads: int, head_dim: int,
+                      tiles=None, num_slots: int = None) -> list:
+    """One (2 * slots, kv, rows, head_dim) shape per full-attention tile."""
+    if num_slots is None:
+        num_slots = len(cache_slots()[0])
+    return [(2 * int(num_slots), int(num_kv_heads), int(rows), int(head_dim))
+            for rows in full_cache_tiles(context_length, tiles)]
+
+
+def sliding_phase(pos: int, sliding_window: int = SLIDING_WINDOW) -> str:
+    """Which sliding-cache write applies at pos (Gemma 3 prior art).
+
+    'fill' while the window is still filling (the row is written at pos);
+    'rotate' from then on (the cache is full, so the oldest row is dropped and
+    the new one appended).  The ring cache of this module needs neither decision
+    -- the write offset is pos % rows in both phases, which is why a ring costs
+    no copy -- but the ANEMLL prior art names the two functions this way,
+    rotate_cache_rows implements the physical rotate, and the test that pins
+    ring == rotate uses both.
+    """
+    pos = int(pos)
+    if pos < 0:
+        raise ValueError("pos must be >= 0")
+    return "fill" if pos < int(sliding_window) else "rotate"
+
+
+def rotate_cache_rows(cache: torch.Tensor, slot: int, key: torch.Tensor,
+                      value: torch.Tensor, rows: int, num_slots: int) -> None:
+    """Shift-left + append (Gemma 3 _update_kv_local), the physical rotate.
+
+    Positive constants only: torch.narrow with start = the number of new rows and
+    length = rows - that, then torch.cat.  cache[:-1] = cache[1:] and negative
+    slices are what break under torch.jit.trace and on the ANE (gemma3_model.py:
+    1035-1039), so neither appears here.
+    """
+    new_rows = int(key.shape[2])
+    rows = int(rows)
+    if not 0 < new_rows <= rows:
+        raise ValueError(f"cannot rotate {new_rows} new rows into a {rows}-row cache")
+    for idx, new in ((slot, key), (slot + num_slots, value)):
+        current = cache[idx:idx + 1, :, :rows, :]
+        tail = torch.narrow(current, 2, new_rows, rows - new_rows)
+        shifted = torch.cat([tail, new.to(cache.dtype)], dim=2)
+        cache[idx:idx + 1, :, :rows, :] = shifted
+
+
+def merge_attention_partials(partials):
+    """Log-sum-exp combine of the attention partials of a tiled cache.
+
+    partials is a list of (logits, values) pairs for one query block: logits
+    (B, KV, rep*Q, rows_t) already carrying that tile's mask (so columns past the
+    current position are -inf) and values (1, KV, rows_t, head_dim).  Returns
+    (out, total_weights) with out (B, KV, rep*Q, head_dim).
+
+    Attention is a softmax over a *set* of keys, so splitting the set in two and
+    subtracting the maximum over both tiles is exact; a tile whose columns are
+    all masked contributes exp(-inf - m) = 0, which is why the young positions --
+    where the second tile is entirely in the future -- need no special case.
+    This is spec D7's combine, and also the numerically stable form of an
+    ordinary softmax.
+    """
+    if not partials:
+        raise ValueError("merge_attention_partials needs at least one partial")
+    maximum = None
+    for logits, _ in partials:
+        tile_max = logits.amax(dim=-1, keepdim=True)
+        maximum = tile_max if maximum is None else torch.maximum(maximum, tile_max)
+    out = None
+    total = None
+    for logits, values in partials:
+        weights = torch.exp(logits - maximum)
+        tile_total = weights.sum(dim=-1, keepdim=True)
+        contribution = torch.matmul(weights, values)
+        out = contribution if out is None else out + contribution
+        total = tile_total if total is None else total + tile_total
+    return out / total, total
+
+
+def build_tile_masks(start: int, q_len: int, tiles, sliding_rows: int,
+                     sliding_window: int = SLIDING_WINDOW, dtype=torch.float16) -> list:
+    """One mask per full-attention tile, then the sliding mask, as a list.
+
+    Tile i owns absolute positions [offset, offset + rows), so its column j is
+    position offset + j and the causal test is j <= query_pos - offset: the same
+    full_causal_mask with the tile's offset taken off the query row.  A query
+    younger than the tile finds every column masked, which is what the
+    log-sum-exp merge expects.
+    """
+    rows_list = full_cache_tiles(int(sum(tiles)), tiles)
+    masks = [full_causal_mask(int(start) - offset, int(q_len), rows, dtype=dtype)
+             for offset, rows in zip(full_tile_offsets(rows_list), rows_list)]
+    masks.append(sliding_ring_mask(int(start), int(q_len), int(sliding_rows),
+                                   int(sliding_window), dtype=dtype))
+    return masks
+
+
 def cache_positions(start: int, q_len: int, rows: int):
     """Ring positions of the rows a batch of `q_len` at `start` writes.
 
