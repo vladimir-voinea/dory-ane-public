@@ -502,6 +502,11 @@ def generate(runtime, tokenizer, prompt, max_tokens=256, temperature=0.0, top_p=
     prefill_seconds = time.time() - started
     generated = []
     printer = StreamPrinter(tokenizer, out) if stream else None
+    # pos is the row the NEXT generated token occupies: the token sampled from
+    # the prompt's last logits sits at len(prompt_ids), not after it.  The server
+    # does the same (openai_server/service.py feeds decode at the current
+    # position and increments afterwards); incrementing first would write every
+    # key one row late and leave the true row a zero key the mask admits.
     pos = len(prompt_ids)
     eos = set(tokenizer.eos_ids)
     while len(generated) < max_tokens and pos < context - 1:
@@ -509,12 +514,12 @@ def generate(runtime, tokenizer, prompt, max_tokens=256, temperature=0.0, top_p=
         if next_id in eos:
             break
         generated.append(next_id)
-        pos += 1
         if printer is not None:
             printer.update(generated)
-        if len(generated) >= max_tokens or pos >= context - 1:
+        if len(generated) >= max_tokens:
             break
         logits = runtime.decode(next_id, pos).reshape(1, -1)
+        pos += 1
     seconds = time.time() - started
     if printer is not None:
         printer.done()

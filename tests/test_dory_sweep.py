@@ -434,3 +434,53 @@ def test_a_log_without_the_sampler_is_refused(tmp_path):
     log.write_text("nothing to see here")
     with pytest.raises(SystemExit):
         sweep.parse_powermetrics(log.read_text(), "ane")
+
+
+# ---------------------------------------------------------------------------
+# the GPU baseline must measure the same workload as the Neural Engine
+# ---------------------------------------------------------------------------
+
+def test_the_gpu_side_is_fed_the_same_token_ids_as_the_neural_engine():
+    for context in sweep.CONTEXTS:
+        gpu = sweep.gpu_prompt_tokens(context)
+        ane = sweep.workload_ids(context)
+        assert len(gpu) == context
+        assert len(gpu) == len(ane)
+        assert gpu == [int(token) for token in ane.tolist()]
+
+
+def test_the_gpu_request_carries_token_ids_not_text(monkeypatch):
+    import urllib.request
+
+    captured = {}
+
+    class Reply:
+        def read(self):
+            return json.dumps({"timings": {"prompt_n": 3, "predicted_n": 2}}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data)
+        captured["url"] = request.full_url
+        return Reply()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    reply = sweep.gpu_completion(49562, [11, 22, 33], n_predict=2)
+    assert captured["url"].endswith("/completion")
+    assert captured["body"]["prompt"] == [11, 22, 33]
+    assert captured["body"]["n_predict"] == 2
+    assert reply["timings"]["prompt_n"] == 3
+
+
+def test_a_row_the_server_counted_differently_is_refused():
+    sweep.check_prompt_count({"prompt_n": 2048}, 2048, 2048)      # fine
+    with pytest.raises(SystemExit) as error:
+        sweep.check_prompt_count({"prompt_n": 1900}, 2048, 2048)
+    assert "1900" in str(error.value) and "2048" in str(error.value)
+    with pytest.raises(SystemExit):
+        sweep.check_prompt_count({}, 2048, 2048)                  # no count at all

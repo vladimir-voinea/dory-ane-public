@@ -243,6 +243,8 @@ class ScriptedRuntime:
         self.tokens = list(tokens)
         self.step = 0
         self.resets = 0
+        self.prompt_tokens = None
+        self.decoded = []              # (token, pos) in call order
 
     def reset_state(self):
         self.resets += 1
@@ -251,11 +253,21 @@ class ScriptedRuntime:
         chat.DoryRuntime.check_context(self, prompt_tokens, reserve=reserve)
 
     def prefill(self, ids, start=0, progress=None):
+        self.prompt_tokens = int(start) + len(ids)
         if progress is not None:
             progress(len(ids), len(ids), 0.0)
         return np.zeros((len(ids), VOCAB), dtype=np.float32)
 
     def decode(self, token, pos):
+        # The row is part of the contract, so assert it here: a decode that runs
+        # ahead of the sequence must fail a test, not silently write a key one
+        # row late.
+        expected = int(self.prompt_tokens) + len(self.decoded)
+        assert pos == expected, (
+            f"decode fed token {token} at row {pos}, but it belongs at row "
+            f"{expected} ({self.prompt_tokens} prompt tokens, "
+            f"{len(self.decoded)} already decoded)")
+        self.decoded.append((int(token), int(pos)))
         self.step += 1
         logits = np.full(VOCAB, -10.0, dtype=np.float32)
         logits[self.tokens[min(self.step, len(self.tokens) - 1)]] = 10.0
@@ -270,6 +282,25 @@ def test_generate_stops_on_eos():
     result = chat.generate(runtime, tokenizer, "hi", max_tokens=10, stream=False)
     assert result["generated_tokens"] == 2
     assert result["text"] == "zerot6"
+
+
+def test_generate_feeds_each_token_at_its_own_row():
+    """The blocker: the first generated token belongs at row len(prompt).
+
+    The prompt's own last logits produce it, so it is written at the row right
+    after the prompt -- not one row later, which would leave a zero key that the
+    attention mask admits.
+    """
+    runtime = ScriptedRuntime([5, 6, 7, 8])
+    tokenizer = FakeTokenizer([5, 6, 7, 8])
+    result = chat.generate(runtime, tokenizer, "hi", max_tokens=4, stream=False)
+    rows = [pos for _, pos in runtime.decoded]
+    assert runtime.prompt_tokens is not None
+    assert rows, "the loop must feed the generated tokens back"
+    assert rows[0] == runtime.prompt_tokens
+    assert rows == list(range(runtime.prompt_tokens, runtime.prompt_tokens + len(rows)))
+    # the last generated token is never fed back: nothing needs its logits
+    assert len(runtime.decoded) == result["generated_tokens"] - 1
 
 
 def test_generate_respects_max_tokens():
@@ -326,9 +357,12 @@ def test_chatml_fallback_marks_reasoning_on_and_off():
     on = chat.render_template(chat.CHATML_FALLBACK, messages, reasoning=True)
     off = chat.render_template(chat.CHATML_FALLBACK, messages, reasoning=False)
     assert "<|im_start|>user\nhello<|im_end|>" in on
-    assert on.rstrip().endswith("")
-    assert "thinking" in on or "" in on
-    assert " thinking" not in off
+    # reasoning on leaves the assistant turn at the thinking cue ...
+    assert on.rstrip().endswith("thinking")
+    assert " thinking" in on
+    # ... and reasoning off does not write the cue at all
+    assert "thinking" not in off
+    assert off.rstrip().endswith("assistant")
 
 
 def test_chatml_fallback_carries_a_system_prompt():

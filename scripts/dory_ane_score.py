@@ -50,6 +50,32 @@ DEFAULT_WEIGHTS = os.path.expanduser(
     "snapshots/b366b87f762ea334ba3eb55912031baba1515810/model.safetensors")
 
 
+#: The ticket's gates (Testing Decisions): a scoring run that cannot fail is not
+#: a gate.  --max-kld / --min-top1 override them for a diagnostic run; the exit
+#: status still says whether the numbers passed whatever thresholds were used.
+MAX_MEAN_KLD = 0.01
+MIN_TOP1 = 0.98
+
+
+def judge(mean_kld, top1, max_kld=MAX_MEAN_KLD, min_top1=MIN_TOP1):
+    """(passed, [failures]) for one scored result.
+
+    NaN or infinite numbers fail: a gate has to treat "no usable measurement"
+    as a failure, never as a pass.
+    """
+    failures = []
+    if not np.isfinite(mean_kld) or float(mean_kld) > float(max_kld):
+        failures.append(f"mean KLD {float(mean_kld):.5f} > {float(max_kld):g}")
+    if not np.isfinite(top1) or float(top1) < float(min_top1):
+        failures.append(f"top-1 {100.0 * float(top1):.2f} % < {100.0 * float(min_top1):.2f} %")
+    return (not failures), failures
+
+
+def judge_text(passed, failures):
+    """The one-line verdict a script prints next to a gate's numbers."""
+    return "PASS" if passed else "FAIL (" + "; ".join(failures) + ")"
+
+
 def log_softmax(logits: torch.Tensor) -> np.ndarray:
     # logits may live on Metal; numpy() needs a host copy first
     return torch.log_softmax(logits.float().to("cpu"), dim=-1).numpy()
@@ -95,7 +121,8 @@ def run_candidate(model, ids, first_scored, rows, mode, batch_size):
     return out
 
 
-def main(argv=None):
+def build_parser():
+    """The command line, kept out of the work so it can be read and tested."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--reference", required=True, help="DANE-2 reference .kld artifact")
     ap.add_argument("--weights", default=DEFAULT_WEIGHTS)
@@ -107,7 +134,15 @@ def main(argv=None):
     ap.add_argument("--out", default="cand_dory_ane.npz")
     ap.add_argument("--meta-out", default=None, help="JSON sidecar for the score result")
     ap.add_argument("--threads", type=int, default=14)
-    args = ap.parse_args(argv)
+    ap.add_argument("--max-kld", type=float, default=MAX_MEAN_KLD,
+                    help=f"mean KLD gate (default {MAX_MEAN_KLD}); the exit status follows it")
+    ap.add_argument("--min-top1", type=float, default=MIN_TOP1,
+                    help=f"top-1 gate (default {MIN_TOP1}); the exit status follows it")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     torch.set_num_threads(args.threads)
     evalset = load_eval_set()
@@ -150,13 +185,19 @@ def main(argv=None):
     cand = read_candidate_npz(args.out)
     result = score_sources(sliced, cand)
     print(result.summary())
+    passed, failures = judge(result.mean_kld, result.top1_agreement,
+                             args.max_kld, args.min_top1)
+    print(f"GATE: {judge_text(passed, failures)} "
+          f"(mean KLD <= {args.max_kld:g}, top-1 >= {100.0 * args.min_top1:.2f} %)")
     payload = result.as_dict()
     payload["candidate_meta"] = meta
     payload["reference"] = args.reference
+    payload["gate"] = {"passed": passed, "failures": failures,
+                       "max_kld": args.max_kld, "min_top1": args.min_top1}
     if args.meta_out:
         with open(args.meta_out, "w") as fh:
             json.dump(payload, fh, indent=2)
-    return 0
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
