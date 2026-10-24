@@ -45,10 +45,17 @@ matter how small the individual states are. The correct design target is therefo
 **as few carriers as the per-state size limit allows**, not as many as possible:
 
 ```
-per-state budget: 24 MiB           -> a 135 MiB sliding cache needs >= 6 carriers
-state-count budget: 56 ok, 63 not  -> a 864 MiB full cache as 36 per-(layer,head) states fits,
-                                      42 carriers carrying 999 MiB loads and predicts
+per-state budget: 24 MiB           -> the 864 MiB full cache as 36 per-(layer,head) states: fits
+state-count budget: 56 ok, 63 not  -> 36 + 9 = 45 states for full + sliding: fits the count
 ```
+
+**A caveat on the 999 MiB row.** That 42-state probe used a sliding shape of (2,4,5760,256)
+chosen only to make the arithmetic round to 22.5 MiB. It is not a real sliding-cache
+shape, and the real cache does not divide that way: 27 layer-slots at 5.0 MiB each give
+either 9 carriers of 15.0 MiB (3 slots each, 45 states total — the design) or 27 carriers
+of 5.0 MiB (63 states — over the count ceiling). The 999 MiB figure is therefore measured
+at 42 carriers with stand-in geometry, and the real 45-carrier layout is stated as the
+design, not as a measurement, until a probe with the real shapes confirms it.
 
 The two limits were found in **opposite directions**: four times more bytes in one third
 of the carriers is fine, and one third of the bytes in twice the carriers is not. A
