@@ -204,10 +204,31 @@ class DoryRuntime:
         """Run every block component in run order, looping the recurrent ones."""
         mask = self.build_mask(start, q_len)
         pos = np.array([start], dtype=np.int32)
-        cache_pos = np.array([start % self.params["sliding_rows"]], dtype=np.int32)
+        rows = int(self.params["sliding_rows"])
+        # The sliding ring is written as one contiguous slice, so a batch that
+        # straddles its seam would be silently clamped by the traced graph (and
+        # raises in eager PyTorch).  dc.cache_positions is the guard the model
+        # uses in eager mode; the runtime has to apply it too, because a resumed
+        # prefill can start at any position, not just a batch boundary.
+        try:
+            ring_pos = int(dc.cache_positions(int(start), int(q_len), rows))
+        except ValueError as exc:
+            raise ValueError(
+                f"a {q_len}-token batch at position {start} would straddle the "
+                f"{rows}-row sliding ring ({int(start) % rows} + {q_len} > {rows}); "
+                f"resume at a multiple of the batch size, or feed a smaller batch"
+            ) from exc
+        cache_pos = np.array([ring_pos], dtype=np.int32)
         function = "prefill" if q_len > 1 else "infer"
         order = [name for name in self.meta["run_order"]
                  if self.meta["components"][name]["kind"] == "blocks"]
+        for name in order:
+            declared = self.meta["components"][name].get("inputs") or []
+            if any(n.startswith("cos_") or n.startswith("sin_") for n in declared):
+                raise RuntimeError(
+                    f"component {name} was converted with --rope-tables-as-inputs, and this "
+                    f"runtime does not yet compute the cos/sin rows to feed it; convert "
+                    f"without that flag until the runtime supplies them")
         hidden = np.ascontiguousarray(hidden, dtype=np.float16)
         index = 0
         while index < len(order):
@@ -639,6 +660,23 @@ def filler_tokens(context: int, tokenizer=None, text=None) -> np.ndarray:
     return ids[:context].astype(np.int32)
 
 
+def bench_workload(context: int, steps: int) -> int:
+    """How many prompt tokens a bench at this context may prefill.
+
+    The benchmark decodes a number of tokens after the prefill, and check_context
+    reserves one position for that, so the prompt has to leave that many positions
+    free.  Prefilling the whole context raised ContextOverflowError before the
+    first measurement, which is what made the 24K bench cell unmeasurable.
+    """
+    context, steps = int(context), int(steps)
+    keep = context - max(steps, 1)
+    if keep < 1:
+        raise ContextOverflowError(
+            f"a {format_tokens(context)}-token context leaves no room for {steps} decode "
+            f"step(s); the benchmark needs context_length > tokens")
+    return keep
+
+
 def resident_memory() -> dict:
     """Peak resident set size of this process, in bytes, plus the machine's swap.
 
@@ -669,7 +707,8 @@ def benchmark(args) -> int:
         raise ContextOverflowError(
             f"--context {format_tokens(context)} is beyond the converted context "
             f"{format_tokens(int(runtime.params['context_length']))}")
-    prompt = filler_tokens(context, tokenizer, args.filler_text)
+    steps = int(args.tokens)
+    prompt = filler_tokens(bench_workload(context, steps), tokenizer, args.filler_text)
     printer = _progress_printer() if args.progress else None
     results = []
     for loops in [int(v) for v in str(args.loops).split(",")]:
@@ -679,9 +718,9 @@ def benchmark(args) -> int:
         logits = runtime.prefill(prompt, 0, progress=printer)
         prefill_seconds = time.time() - started
         window = []
-        positions = [context]
+        positions = [int(len(prompt))]
         token = int(np.argmax(logits[-1]))
-        for _ in range(int(args.tokens)):
+        for _ in range(steps):
             started = time.time()
             logits = runtime.decode(token, positions[-1])
             window.append(time.time() - started)
@@ -691,6 +730,7 @@ def benchmark(args) -> int:
         mean = sum(warm) / len(warm)
         result = {"loops": loops, "context": context,
                   "prompt_tokens": int(len(prompt)),
+                  "decode_headroom": int(context - len(prompt)),
                   "prefill_seconds": prefill_seconds,
                   "prefill_tok_s": len(prompt) / max(prefill_seconds, 1e-9),
                   "decode_tok_s": 1.0 / mean, "decode_ms": mean * 1e3,

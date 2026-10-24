@@ -372,12 +372,15 @@ def test_measure_speed_fills_every_cell_it_is_asked_for():
         [sweep.speed_key("ane", "lut6", 2048, 1), sweep.speed_key("ane", "lut6", 2048, 2),
          sweep.speed_key("ane", "lut6", 4096, 1), sweep.speed_key("ane", "lut6", 4096, 2)])
     for value in cells.values():
-        assert value["prompt_tokens"] in (2048, 4096)
+        # the prompt leaves room for the decode steps: check_context reserves one
+        # position, and a context-sized prompt overflowed before the first cell
+        assert value["prompt_tokens"] in (2048 - 4, 4096 - 4)
+        assert value["decode_headroom"] == 4
         assert value["prefill_tok_s"] > 0
         assert value["decode_tok_s"] > 0
         assert value["peak_rss_bytes"] > 0
     assert runtime.resets == 4            # one reset per cell
-    assert runtime.prefills == [(2048, 0), (4096, 0), (2048, 0), (4096, 0)]
+    assert runtime.prefills == [(2044, 0), (4092, 0), (2044, 0), (4092, 0)]
 
 
 def test_the_workload_is_the_same_prompt_at_every_context():
