@@ -210,7 +210,10 @@ def estimate_component_bytes(spec: ComponentSpec, config, lut_bits) -> int:
     params = estimate_component_params(spec, config)
     if lut_bits is None:
         return int(params * 2 * 1.02)
-    return int(params * (int(lut_bits) + 2) / 8.0 * 1.05)
+    # coremltools palettizes per grouped channel over a group of 16 weights, so
+    # the fp16 scale costs one bit per 16 weights, not one scale per 8.  Measured
+    # on the lm_head package: 335.5M params -> 242 MiB = 0.759 B/param (6.07 bits).
+    return int(params * (int(lut_bits) + 1 / 16.0) / 8.0 * 1.02)
 
 
 def disk_needed(estimates) -> int:
