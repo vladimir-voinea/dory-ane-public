@@ -50,12 +50,19 @@ CTX = 4096
 CHUNKS = 2
 
 # name -> (mode, loops, n_batch)
+# Decode references exist at every loop count the tickets report (1, 2, 4), at
+# both batchings a candidate runs: one token per decode step and 64-token
+# prefill.  Each is scored against the exact reference with the SAME loop count.
 REFERENCES = {
     "bf16_exact_loop1": ("exact", 1, 4096),
     "bf16_exact_loop2": ("exact", 2, 4096),
     "bf16_exact_loop4": ("exact", 4, 4096),
+    "bf16_decode_loop1_batch1": ("decode", 1, 1),
+    "bf16_decode_loop1_batch64": ("decode", 1, 64),
     "bf16_decode_loop2_batch1": ("decode", 2, 1),
     "bf16_decode_loop2_batch64": ("decode", 2, 64),
+    "bf16_decode_loop4_batch1": ("decode", 4, 1),
+    "bf16_decode_loop4_batch64": ("decode", 4, 64),
 }
 
 
@@ -251,29 +258,39 @@ def q8_proof(args, eval_set, gguf_sha) -> dict:
 
 
 def gap_report(args) -> dict:
-    """Score the decode-mode references against the exact one: the last_loop floor."""
-    exact = args.out_dir / "bf16_exact_loop2.kld"
+    """Score every decode-mode reference against its exact one: the last_loop floor.
+
+    Each decode reference is scored against the exact reference with the SAME
+    loop count - that is the model the candidate is trying to reproduce - so the
+    floor is reported per loop count and per batching.
+    """
     out = {}
     scores = args.out_dir / "scores"
     scores.mkdir(parents=True, exist_ok=True)
-    if not exact.is_file():
-        print("[gap] exact loop2 reference missing, skipping", flush=True)
-        return out
-    for name in ("bf16_decode_loop2_batch1", "bf16_decode_loop2_batch64"):
+    for name, (mode, loops, n_batch) in REFERENCES.items():
+        if mode != "decode":
+            continue
+        exact = args.out_dir / f"bf16_exact_loop{loops}.kld"
         path = args.out_dir / f"{name}.kld"
+        if not exact.is_file():
+            print(f"[gap] {exact.name} missing, skipping {name}", flush=True)
+            continue
         if not path.is_file():
             print(f"[gap] {name} missing, skipping", flush=True)
             continue
         result = score_files(exact, path)
         payload = result.as_dict()
         payload["note"] = (
-            "exact mode is the reference here: this number is the floor any last_loop "
-            "candidate can reach against a per_loop reference"
+            "exact mode with the same loop count is the reference here: this number is "
+            "the floor any last_loop candidate can reach against a per_loop reference"
         )
+        payload["loops"] = loops
+        payload["n_batch"] = n_batch
+        payload["exact_reference"] = str(exact)
         out[name] = payload
         print(
             f"[gap] {name}: mean KLD {result.mean_kld:.6f}, "
-            f"top-1 {100 * result.top1_agreement:.3f}%",
+            f"top-1 {100 * result.top1_agreement:.3f}% vs {exact.name}",
             flush=True,
         )
     if out:

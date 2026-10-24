@@ -53,8 +53,12 @@ Built with llama.cpp at PR #30306, BF16 GGUF, in the two modes the spec names:
 | `bf16_exact_loop1.kld` | exact | 1 | `-b 4096 -ub 4096` | full recompute, loop budget 1 |
 | `bf16_exact_loop2.kld` | exact | 2 | `-b 4096 -ub 4096` | **the gate reference** |
 | `bf16_exact_loop4.kld` | exact | 4 | `-b 4096 -ub 4096` | full recompute, loop budget 4 |
+| `bf16_decode_loop1_batch1.kld` | decode | 1 | `-b 1 -ub 1` | one token per step, loop budget 1 |
+| `bf16_decode_loop1_batch64.kld` | decode | 1 | `-b 64 -ub 64` | 64-token prefill batches, loop budget 1 |
 | `bf16_decode_loop2_batch1.kld` | decode | 2 | `-b 1 -ub 1` | one token per step, as a decoder runs |
 | `bf16_decode_loop2_batch64.kld` | decode | 2 | `-b 64 -ub 64` | 64-token prefill batches |
+| `bf16_decode_loop4_batch1.kld` | decode | 4 | `-b 1 -ub 1` | one token per step, loop budget 4 |
+| `bf16_decode_loop4_batch64.kld` | decode | 4 | `-b 64 -ub 64` | 64-token prefill batches, loop budget 4 |
 
 * **exact** = `dory.recurrent_kv_cache_mode=per_loop` with **one ubatch per
   context** (`-b 4096 -ub 4096`): every loop keeps its own KV cache and the
@@ -63,7 +67,10 @@ Built with llama.cpp at PR #30306, BF16 GGUF, in the two modes the spec names:
 * **decode** = `dory.recurrent_kv_cache_mode=last_loop`: one KV cache per
   recurrent layer, overwritten each loop, so the result *does* depend on the
   batching the candidate actually uses. This is what a cached ANE or Core ML
-  pipeline is scored against, at the batching it really runs.
+  pipeline is scored against, at the batching it really runs. Decode references
+  exist at **loops 1, 2 and 4**, at both batchings, so every loop count a port
+  reports has a matching floor; each is scored against the exact reference with
+  the same loop count.
 
 **The ubatch is not cosmetic.** Exact mode is batching-independent only when
 the whole context is one ubatch, because llama.cpp's 1024-token sliding window
@@ -170,19 +177,30 @@ row counts or vocabulary sizes differ.
 | candidate | reference | rows | mean KLD | top-1 | PPL cand / ref |
 |---|---|---|---|---|---|
 | **Q8_0 GGUF, exact, 2 loops** | BF16 exact loop2 | 4094 | **0.000423 ± 0.000008** | **98.461 %** | 20.204 / 20.238 |
+| BF16 decode, loops 1, 1 token per step | BF16 exact loop1 | 4094 | 0.000016 ± 0.000001 | 99.658 % | 20.719 / 20.727 |
+| BF16 decode, loops 1, 64-token batches | BF16 exact loop1 | 4094 | 0.000025 ± 0.000001 | 99.634 % | 20.718 / 20.727 |
 | BF16 decode, 1 token per step | BF16 exact loop2 | 4094 | 0.006975 ± 0.000363 | 96.116 % | 19.864 / 20.238 |
 | BF16 decode, 64-token batches | BF16 exact loop2 | 4094 | 0.002857 ± 0.000109 | 97.557 % | 19.987 / 20.238 |
+| BF16 decode, loops 4, 1 token per step | BF16 exact loop4 | 4094 | 0.003490 ± 0.000185 | 97.313 % | 19.941 / 20.194 |
+| BF16 decode, loops 4, 64-token batches | BF16 exact loop4 | 4094 | 0.002581 ± 0.000152 | 97.557 % | 19.979 / 20.194 |
 | BF16 exact, loops 1 (context) | BF16 exact loop2 | 4094 | 0.016054 | 93.087 % | 20.727 / 20.238 |
 
 Reference PPL on this set: **20.73 / 20.24 / 20.19** at 1 / 2 / 4 loops.
-Every artifact is 1,073,283,076 bytes (1.07 GB); the six of them plus the JSON
-reports are 6.4 GB.
+Every artifact is 1,073,283,076 bytes (1.07 GB); the nine of them plus the JSON
+reports are 9.7 GB.
 
-**The last two rows are the floor for any `last_loop` candidate.** A cached model that
-runs `per_loop` is exact; one that runs `last_loop` cannot do better than the
-batching it uses: 0.0029 KLD / 97.6 % top-1 with 64-token prefill batches, 0.0070 /
-96.1 % with one token per step. On this text the caching penalty is 7-16x the Q8_0
-quantisation error, so DANE-4/DANE-5 should treat ~0.003-0.007 as their real
+**The decode rows are the floor for any `last_loop` candidate.** A cached model
+that runs `per_loop` is exact; one that runs `last_loop` cannot do better than the
+batching it uses, and the floor is reported per loop count, each against the
+exact reference with the same loop count:
+
+* 64-token prefill batches: 2.5e-05 KLD / 99.6 % top-1 at loops 1, 0.0029 KLD / 97.6 % top-1 at loops 2, 0.0026 KLD / 97.6 % top-1 at loops 4;
+* one token per step: 1.6e-05 KLD / 99.7 % top-1, 0.0070 KLD / 96.1 % top-1 and 0.0035 KLD / 97.3 % top-1.
+
+At loops 1 there is nothing to lose - a single loop never overwrites a KV row,
+so the floor is kernel noise (about 1e-5) and a port can be held to the exact
+gate itself. From two loops up the cached penalty is several times the Q8_0
+quantisation error, so DANE-4/DANE-5 should treat those floors as their real
 headroom, not 0.
 
 **The scorer is verified against llama.cpp itself.** Scoring the Q8_0 candidate
@@ -243,7 +261,8 @@ that candidate's float16 storage).
   mean KLD <= 0.005.
 * **DANE-4/DANE-5** (FP16 + Core ML on the ANE): emit `mode="decode"` candidates
   with the pipeline's own batching and score them against the matching decode
-  reference. Gate: mean KLD <= 0.05, top-1 >= 93% - and the decode floor in the
+  reference - `bf16_decode_loop{L}_batch{1,64}.kld` exists at loops 1, 2 and 4,
+  so a port that changes the loop count is scored the same way. Gate: mean KLD <= 0.05, top-1 >= 93% - and the decode floor in the
   table above is the best any `last_loop` candidate can reach.
 * Nothing here touches the ANE: the reference is a file, so scoring is offline
   and repeatable.
@@ -254,8 +273,13 @@ that candidate's float16 storage).
     curl -O https://www.gutenberg.org/cache/epub/1342/pg1342.txt
     python -m anemll.eval.eval_set --source pg1342.txt --tokenizer <Dory BF16 snapshot>
 
-    # 2. the reference artifacts (~2 min for the five, plus the Q8_0 proof)
+    # 2. the reference artifacts (nine dumps: exact at loops 1/2/4, decode at
+    #    loops 1/2/4 x batch 1 and 64; a few minutes, plus the Q8_0 proof)
     python scripts/make_dory_references.py --llama-perplexity <build>/bin/llama-perplexity         --bf16-gguf <BF16.gguf> --q8-gguf <Q8_0.gguf>
+
+    #    a subset is --only with names from REFERENCES, e.g. the decode
+    #    references at loops 1 and 4 on their own:
+    python scripts/make_dory_references.py --llama-perplexity <build>/bin/llama-perplexity         --bf16-gguf <BF16.gguf>         --only bf16_decode_loop1_batch1 bf16_decode_loop1_batch64             bf16_decode_loop4_batch1 bf16_decode_loop4_batch64
 
     # 3. tests
     python -m pytest tests/test_dory_kld.py tests/test_dory_eval_set.py
