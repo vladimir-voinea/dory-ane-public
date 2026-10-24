@@ -80,6 +80,38 @@ def resolve_model_path(model_dir: Path, file_name: str) -> Path:
                             f"exists in {model_dir}")
 
 
+def _check_coreml_cache() -> None:
+    """Fail with the real cause when Core ML cannot write its model cache.
+
+    Loading a .mlpackage makes Core ML compile it and cache the result under
+    ~/Library/Caches/com.apple.CoreML.  If that directory is not writable (a
+    sandboxed shell, a restricted container, a read-only home) Core ML reports
+    the unhelpful "Failed to build the model execution plan ... error code -14";
+    the cause is the denied write, not the model.  Say so, with the path and the
+    fix, instead of letting -14 masquerade as a broken package.
+    """
+    global _COREML_CACHE_OK
+    if _COREML_CACHE_OK is not None:
+        return
+    cache = Path.home() / "Library" / "Caches" / "com.apple.CoreML"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        probe = cache / ".dory_cache_probe"
+        probe.write_text("ok")
+        probe.unlink()
+        _COREML_CACHE_OK = True
+    except Exception as exc:  # noqa: BLE001 - any failure means "not writable"
+        raise RuntimeError(
+            f"Core ML cache not writable at {cache}: {exc}. Core ML must write its "
+            "compiled-model cache there to load a model; when the write is denied it "
+            "reports error -14, which looks like a broken package but is a permission "
+            "problem. Run in a shell that can write that directory (or grant Full Disk "
+            "Access to the process), then retry.") from exc
+
+
+_COREML_CACHE_OK = None
+
+
 def load_function(path: Path, function_name: str = None, compute_units=None):
     """Load one package, which holds exactly one function.
 
@@ -93,9 +125,10 @@ def load_function(path: Path, function_name: str = None, compute_units=None):
     if compute_units is None:
         compute_units = ct.ComputeUnit.CPU_AND_NE
     path = Path(path)
+    _check_coreml_cache()
     if path.suffix == ".mlmodelc":
         return ct.models.CompiledMLModel(str(path), compute_units)
-    return ct.models.MLModel(str(path))
+    return ct.models.MLModel(str(path), compute_units=compute_units)
 
 
 class DoryRuntime:
