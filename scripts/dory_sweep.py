@@ -500,36 +500,57 @@ def measure_speed(model_dir, config: str, contexts: Sequence[int], loops_list: S
         tokenizer = None
 
     out: Dict[str, dict] = {}
+    steps = int(tokens)
     for loops in loops_list:
         runtime.set_loops(int(loops))
         for context in contexts:
-            ids = workload_ids(int(context), tokenizer)
-            runtime.reset_state()
-            started = time.perf_counter()
-            logits = runtime.prefill(ids, 0)
-            prefill_seconds = max(time.perf_counter() - started, 1e-9)
-            window: List[float] = []
-            position = int(context)
-            token = int(np.argmax(np.asarray(logits[-1]).reshape(-1)))
-            for _ in range(int(tokens)):
+            key = speed_key("ane", config, int(context), int(loops))
+            # One cell failing must not discard the cells that already worked: a
+            # 24K context that overflows used to lose the 2K/8K/16K numbers with
+            # it, because they only lived in this local.  The prompt leaves room
+            # for the decode steps, because check_context reserves one position
+            # and a full-context prompt raised before any measurement.
+            try:
+                prompt_tokens = max(int(context) - max(steps, 1), 0)
+                if prompt_tokens < 1:
+                    raise ValueError(
+                        f"a {int(context)}-token context leaves no room for {steps} "
+                        f"decode step(s)")
+                ids = workload_ids(prompt_tokens, tokenizer)
+                runtime.reset_state()
                 started = time.perf_counter()
-                logits = runtime.decode(token, position)
-                window.append(time.perf_counter() - started)
-                token = int(np.argmax(np.asarray(logits).reshape(-1)))
-                position += 1
-            warm = window[int(len(window) * warm_fraction):] or window
-            mean = float(np.mean(warm)) if warm else float("nan")
-            resident = _resident_memory()
-            out[speed_key("ane", config, int(context), int(loops))] = {
-                "decode_tok_s": (1.0 / mean) if mean > 0 else float("nan"),
-                "decode_ms": mean * 1e3,
-                "prefill_tok_s": len(ids) / prefill_seconds,
-                "prefill_seconds": prefill_seconds,
-                "prompt_tokens": int(len(ids)),
-                "decoded_tokens": int(len(warm)),
-                "peak_rss_bytes": int(resident["peak_rss_bytes"]),
-                "machine": resident.get("machine", {}),
-            }
+                logits = runtime.prefill(ids, 0)
+                prefill_seconds = max(time.perf_counter() - started, 1e-9)
+                window: List[float] = []
+                position = int(len(ids))
+                token = int(np.argmax(np.asarray(logits[-1]).reshape(-1)))
+                for _ in range(steps):
+                    started = time.perf_counter()
+                    logits = runtime.decode(token, position)
+                    window.append(time.perf_counter() - started)
+                    token = int(np.argmax(np.asarray(logits).reshape(-1)))
+                    position += 1
+                warm = window[int(len(window) * warm_fraction):] or window
+                mean = float(np.mean(warm)) if warm else float("nan")
+                resident = _resident_memory()
+                out[key] = {
+                    "decode_tok_s": (1.0 / mean) if mean > 0 else float("nan"),
+                    "decode_ms": mean * 1e3,
+                    "prefill_tok_s": len(ids) / prefill_seconds,
+                    "prefill_seconds": prefill_seconds,
+                    "prompt_tokens": int(len(ids)),
+                    "decode_headroom": int(context) - int(len(ids)),
+                    "decoded_tokens": int(len(warm)),
+                    "peak_rss_bytes": int(resident["peak_rss_bytes"]),
+                    "machine": resident.get("machine", {}),
+                }
+            except Exception as exc:                  # one cell, not the whole sweep
+                out[key] = {"error": f"{type(exc).__name__}: {exc}",
+                            "context": int(context), "loops": int(loops)}
+                out.setdefault("errors", []).append(key)
+    if "errors" in out:
+        print(f"[speed] {len(out['errors'])} cell(s) failed: {out['errors']}",
+              file=sys.stderr)
     return out
 
 
