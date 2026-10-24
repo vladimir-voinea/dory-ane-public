@@ -54,6 +54,9 @@ __all__ = [
     "block_input_names",
     "BlockChunk",
     "TiledBlockChunk",
+    "RopeBlockChunk",
+    "TiledRopeBlockChunk",
+    "traced_block_chunk_class",
     "EmbeddingChunk",
     "LMHeadChunk",
     "empty_state_carrier",
@@ -158,9 +161,12 @@ class BlockChunk(_StateTouching):
         self.loop_exit = bool(loop_exit)
 
     def run(self, hidden_states, causal_mask, current_pos, cache_pos, h_in=None,
-            write_index_1=None, write_gate_1=None, write_index_2=None, write_gate_2=None):
+            write_index_1=None, write_gate_1=None, write_index_2=None, write_gate_2=None,
+            cos_sliding=None, sin_sliding=None, cos_full=None, sin_full=None):
         out = self.chunk(hidden_states, causal_mask, current_pos, cache_pos, h_in,
-                         write_index_1, write_gate_1, write_index_2, write_gate_2)
+                         write_index_1, write_gate_1, write_index_2, write_gate_2,
+                         cos_sliding=cos_sliding, sin_sliding=sin_sliding,
+                         cos_full=cos_full, sin_full=sin_full)
         return self.touch_states(out)
 
     def forward(self, hidden_states, causal_mask, current_pos, cache_pos, h_in=None):
@@ -180,6 +186,46 @@ class TiledBlockChunk(BlockChunk):
                 write_index_1, write_gate_1, write_index_2, write_gate_2, h_in=None):
         return self.run(hidden_states, causal_mask, current_pos, cache_pos, h_in,
                         write_index_1, write_gate_1, write_index_2, write_gate_2)
+
+
+class RopeBlockChunk(BlockChunk):
+    """Traced with the RoPE cos/sin rows as inputs (the 24K shape); h_in last.
+
+    A traced signature has to put every tensor input first, because
+    torch.jit.trace cannot be handed a None placeholder, so each present group of
+    inputs gets a class whose parameter order is exactly block_input_names().
+    h_in stays the fifth positional argument of the plain BlockChunk, which is
+    where the eager callers and the block tests pass it.
+    """
+
+    def forward(self, hidden_states, causal_mask, current_pos, cache_pos,
+                cos_sliding, sin_sliding, cos_full, sin_full, h_in=None):
+        return self.run(hidden_states, causal_mask, current_pos, cache_pos, h_in,
+                        cos_sliding=cos_sliding, sin_sliding=sin_sliding,
+                        cos_full=cos_full, sin_full=sin_full)
+
+
+class TiledRopeBlockChunk(BlockChunk):
+    """Both: the tile write inputs and the RoPE rows, h_in last."""
+
+    def forward(self, hidden_states, causal_mask, current_pos, cache_pos,
+                write_index_1, write_gate_1, write_index_2, write_gate_2,
+                cos_sliding, sin_sliding, cos_full, sin_full, h_in=None):
+        return self.run(hidden_states, causal_mask, current_pos, cache_pos, h_in,
+                        write_index_1, write_gate_1, write_index_2, write_gate_2,
+                        cos_sliding=cos_sliding, sin_sliding=sin_sliding,
+                        cos_full=cos_full, sin_full=sin_full)
+
+
+def traced_block_chunk_class(tiled: bool, rope_tables: bool):
+    """The wrapper whose signature is exactly block_input_names(tiled, _, rope)."""
+    if tiled and rope_tables:
+        return TiledRopeBlockChunk
+    if tiled:
+        return TiledBlockChunk
+    if rope_tables:
+        return RopeBlockChunk
+    return BlockChunk
 
 
 class EmbeddingChunk(_StateTouching):

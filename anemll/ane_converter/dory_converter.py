@@ -121,6 +121,8 @@ class ComponentSpec:
     loop_exit: bool = False
     calls_per_token: object = 1
     lut_role: str = "blocks"
+    tiled: bool = False
+    rope_tables: bool = False
 
     @property
     def inputs(self) -> list:
@@ -128,14 +130,42 @@ class ComponentSpec:
             return ["input_ids"]
         if self.kind == "lm_head":
             return ["hidden_states"]
-        names = ["hidden_states", "causal_mask", "current_pos", "cache_pos"]
-        if self.loop_entry:
-            names.append("h_in")
-        return names
+        # one source of truth: the wrapper classes pick their signature from the
+        # same function, so a converted input name cannot drift from the trace
+        return dch.block_input_names(self.tiled, self.loop_entry, self.rope_tables)
 
     @property
     def is_recurrent(self) -> bool:
         return self.loop_entry or self.loop_exit
+
+
+def input_spec(name: str, seq: int, config):
+    """(traced shape, torch dtype, Core ML dtype) of one declared input.
+
+    One table feeds both the traced example tuple and the ct.TensorType list, so
+    an input cannot appear in one and not the other.  That is how the per-tile
+    write index and gate, and the four RoPE row tensors, stay in step with the
+    wrapper signature that block_input_names() describes.
+    """
+    if name == "input_ids":
+        return (1, int(seq)), torch.int32, np.int32
+    if name == "causal_mask":
+        return (1, 1, int(seq), int(config.mask_len)), config.dtype, np.float16
+    if name in ("current_pos", "cache_pos") or name.startswith("write_index_"):
+        return (1,), torch.int32, np.int32
+    if name.startswith("write_gate_"):
+        return (1,), config.dtype, np.float16
+    if name.startswith("cos_") or name.startswith("sin_"):
+        # the rows the graph would have sliced from its own table (24K option)
+        return (1, 1, int(seq), int(config.head_dim)), config.dtype, np.float16
+    # hidden_states, h_in: one hidden vector per row
+    return (1, int(seq), int(config.hidden_size)), config.dtype, np.float16
+
+
+def tiling_flags(config) -> tuple:
+    """(tiled, rope_tables) as the components of this config must be built."""
+    tiles = tuple(getattr(config, "full_tiles", (1,)) or (1,))
+    return len(tiles) > 1, bool(getattr(config, "rope_tables_as_inputs", False))
 
 
 def component_specs(config, recurrent_splits: int = 1) -> list:
@@ -156,9 +186,12 @@ def component_specs(config, recurrent_splits: int = 1) -> list:
         raise ValueError(f"input+recurrent blocks ({rec_end}) exceed the model's "
                          f"{num_blocks} blocks")
 
+    tiled, rope_tables = tiling_flags(config)
+    flags = dict(tiled=tiled, rope_tables=rope_tables)
     specs = [ComponentSpec("embeddings", "embeddings", None, calls_per_token=1,
                            lut_role="embeddings")]
-    specs.append(ComponentSpec("input", "blocks", (0, input_end), calls_per_token=1))
+    specs.append(ComponentSpec("input", "blocks", (0, input_end), calls_per_token=1,
+                               **flags))
 
     base, rem = divmod(rec_end - rec_start, recurrent_splits)
     start = rec_start
@@ -169,10 +202,12 @@ def component_specs(config, recurrent_splits: int = 1) -> list:
             name, "blocks", (start, end),
             loop_entry=(i == 0),
             loop_exit=(i == recurrent_splits - 1),
-            calls_per_token="loops"))
+            calls_per_token="loops",
+            **flags))
         start = end
 
-    specs.append(ComponentSpec("output", "blocks", (rec_end, num_blocks), calls_per_token=1))
+    specs.append(ComponentSpec("output", "blocks", (rec_end, num_blocks), calls_per_token=1,
+                               **flags))
     specs.append(ComponentSpec("lm_head", "lm_head", None, calls_per_token=1,
                                lut_role="lm_head"))
     return specs
@@ -288,26 +323,42 @@ def _lut_value(bits):
 
 
 def _state_descriptions(config) -> list:
-    """The two Core ML states, with their shapes and byte cost."""
-    full_shape, sliding_shape = dc.cache_shapes(
+    """One Core ML state per cache buffer, with its shape and byte cost.
+
+    The tiled fallback (spec D7) replaces the single full cache with one buffer
+    per tile, so the list comes from dch.state_attrs -- the same function the
+    model registers its buffers from and the runtime builds its MLState from.  A
+    hard-coded pair here was exactly what made a tiled spec unconvertible.
+    """
+    tiles = tuple(getattr(config, "full_tiles", (1,)) or (1,))
+    full_shapes = dc.full_cache_shapes(
+        config.context_length, config.num_key_value_heads, config.head_dim,
+        tiles, num_slots=config.num_full_caches)
+    _, sliding_shape = dc.cache_shapes(
         config.context_length, config.num_key_value_heads, config.head_dim,
         config.sliding_window, config.batch_size)
-    names = dch.state_names()
+    names = dch.state_names(config)
+    attrs = dch.state_attrs(config)
+    shapes = list(full_shapes) + [sliding_shape]
+    kinds = ["full"] * len(full_shapes) + ["sliding"]
     out = []
-    for attr, name, shape, kind, slots in (
-            ("kv_cache_full", names[0], full_shape, "full", config.num_full_caches),
-            ("kv_cache_sliding", names[1], sliding_shape, "sliding", config.num_sliding_caches)):
+    for index, (attr, name, shape, kind) in enumerate(zip(attrs, names, shapes, kinds)):
         elements = int(np.prod(shape))
-        out.append({
+        entry = {
             "name": name,
             "buffer": attr,
             "kind": kind,
-            "slots": int(slots),
+            "slots": int(config.num_full_caches if kind == "full"
+                         else config.num_sliding_caches),
             "shape": [int(d) for d in shape],
             "rows": int(shape[2]),
             "dtype": "float16",
             "bytes": elements * 2,
-        })
+        }
+        if kind == "full" and len(full_shapes) > 1:
+            entry["tile"] = index + 1
+            entry["tile_offset"] = int(sum(int(r) for r in tiles[:index]))
+        out.append(entry)
     return out
 
 
@@ -349,6 +400,8 @@ def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="d
             entry["blocks"] = [int(spec.blocks[0]), int(spec.blocks[1])]
             entry["loop_entry"] = bool(spec.loop_entry)
             entry["loop_exit"] = bool(spec.loop_exit)
+            entry["tiled"] = bool(spec.tiled)
+            entry["rope_tables"] = bool(spec.rope_tables)
         if spec.kind == "lm_head":
             entry["outputs"] = ([f"argmax_idx_{i}" for i in range(1, len(lm_head_chunk_sizes) + 1)]
                                 if argmax else
@@ -397,6 +450,10 @@ def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="d
             "split_lm_head": len(lm_head_chunk_sizes),
             "lm_head_chunk_sizes": [int(s) for s in lm_head_chunk_sizes],
             "argmax_in_model": bool(argmax),
+            "full_cache_tiles": [int(rows) for rows in
+                                 (getattr(config, "full_tiles", (1,)) or (1,))],
+            "full_cache_tiled": bool(tiling_flags(config)[0]),
+            "rope_tables_as_inputs": bool(tiling_flags(config)[1]),
             "lut_embeddings": _lut_value(lut_bits.get("embeddings")),
             "lut_blocks": _lut_value(lut_bits.get("blocks")),
             "lut_lm_head": _lut_value(lut_bits.get("lm_head")),
@@ -407,6 +464,11 @@ def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="d
             "dtype": "float16",
             "write_scheme": "ring",
             "invalidate_on_loop_change": True,
+            "tiled": bool(tiling_flags(config)[0]),
+            "write_frame": ("one full-attention tile per call: the host passes "
+                            "write_index_i / write_gate_i for every tile"
+                            if tiling_flags(config)[0] else
+                            "one contiguous write at cache_pos"),
             "states": states,
         },
         "loops": {"min": 1, "max": 4, "default": 2},
@@ -468,11 +530,39 @@ def validate_meta(meta) -> list:
     need(kv.get("mode") == "last_loop",
          f"kv.mode must be 'last_loop', got {kv.get('mode')!r}")
     states = kv.get("states") or []
-    need(len(states) == 2, f"kv.states must declare the two cache buffers, got {len(states)}")
+    tiles = params.get("full_cache_tiles") or ([context] if isinstance(context, int) else [1])
+    tiled = bool(params.get("full_cache_tiled", len(tiles) > 1))
+    n_full = len(tiles) if tiled else 1
+    need(len(states) == n_full + 1,
+         f"kv.states must declare one buffer per full-attention tile plus the sliding "
+         f"cache ({n_full + 1} with {n_full} tile(s)), got {len(states)}")
+    need(bool(kv.get("tiled", tiled)) == tiled,
+         f"kv.tiled ({kv.get('tiled')}) disagrees with parameters.full_cache_tiled ({tiled})")
+    full_states = [state for state in states if state.get("kind") == "full"]
+    sliding_states = [state for state in states if state.get("kind") == "sliding"]
+    need(len(full_states) == n_full,
+         f"kv.states declares {len(full_states)} full-attention buffers, expected {n_full}")
+    need(len(sliding_states) == 1,
+         f"kv.states declares {len(sliding_states)} sliding buffers, expected 1")
     for state in states:
         need(bool(state.get("name")), "every kv state needs a name")
         need(isinstance(state.get("shape"), list) and state.get("shape"),
              f"kv state {state.get('name')} needs a shape")
+    if isinstance(context, int) and full_states:
+        rows = 0
+        for state in full_states:
+            shape = state.get("shape") or []
+            if len(shape) == 4:
+                rows += int(shape[2])
+        need(rows == context,
+             f"the full-attention tiles hold {rows} rows in total, expected context_length "
+             f"{context}")
+    if tiled:
+        need(len(tiles) > 1, "parameters.full_cache_tiled is true but full_cache_tiles "
+                             "lists a single tile")
+        need(sum(int(r) for r in tiles) == context,
+             f"full_cache_tiles {list(tiles)} sum to {sum(int(r) for r in tiles)}, "
+             f"not context_length {context}")
 
     tokenizer = meta.get("tokenizer") or {}
     need(bool(tokenizer.get("file")), "tokenizer.file is required")
@@ -809,9 +899,10 @@ class DoryConverter(BaseConverter):
                                       argmax=self.argmax)
             model.lm_head = None  # the weights are in the wrapper now
         else:
-            wrapper = dch.BlockChunk(model.model, spec.blocks[0], spec.blocks[1],
-                                     loop_entry=spec.loop_entry,
-                                     loop_exit=spec.loop_exit)
+            # the signature has to be exactly spec.inputs / block_input_names order
+            wrapper = dch.traced_block_chunk_class(spec.tiled, spec.rope_tables)(
+                model.model, spec.blocks[0], spec.blocks[1],
+                loop_entry=spec.loop_entry, loop_exit=spec.loop_exit)
         wrapper.eval()
         for param in wrapper.parameters():
             param.requires_grad = False
@@ -819,37 +910,23 @@ class DoryConverter(BaseConverter):
 
     # -- tracing / conversion ---------------------------------------------
     def _example_inputs(self, spec: ComponentSpec, seq: int):
-        dtype = self.config.dtype
-        hidden = torch.zeros(1, seq, self.config.hidden_size, dtype=dtype)
-        if spec.kind == "embeddings":
-            # int32 end to end: torch's embedding accepts it (checked) and the
-            # Core ML input is declared int32, so there is no dtype cast to get
-            # wrong between the trace and the converted graph.
-            return (torch.zeros(1, seq, dtype=torch.int32),)
-        if spec.kind == "lm_head":
-            return (hidden,)
-        mask = torch.zeros(1, 1, seq, self.config.mask_len, dtype=dtype)
-        pos = torch.zeros(1, dtype=torch.int32)
-        cache_pos = torch.zeros(1, dtype=torch.int32)
-        args = [hidden, mask, pos, cache_pos]
-        if spec.loop_entry:
-            args.append(hidden.clone())
+        """One zero tensor per declared input, in the declared order.
+
+        int32 end to end for input_ids: torch's embedding accepts it (checked)
+        and the Core ML input is declared int32, so there is no dtype cast to get
+        wrong between the trace and the converted graph.
+        """
+        args = []
+        for name in spec.inputs:
+            shape, torch_dtype, _ = input_spec(name, seq, self.config)
+            args.append(torch.zeros(*shape, dtype=torch_dtype))
         return tuple(args)
 
     def _coreml_inputs(self, spec: ComponentSpec, seq: int) -> list:
-        dtype = self.config.dtype
-        hidden = (1, seq, self.config.hidden_size)
         types = []
         for name in spec.inputs:
-            if name == "input_ids":
-                types.append(ct.TensorType(name=name, shape=(1, seq), dtype=np.int32))
-            elif name == "causal_mask":
-                types.append(ct.TensorType(name=name, shape=(1, 1, seq, self.config.mask_len),
-                                           dtype=np.float16))
-            elif name in ("current_pos", "cache_pos"):
-                types.append(ct.TensorType(name=name, shape=(1,), dtype=np.int32))
-            else:
-                types.append(ct.TensorType(name=name, shape=hidden, dtype=np.float16))
+            shape, _, ml_dtype = input_spec(name, seq, self.config)
+            types.append(ct.TensorType(name=name, shape=shape, dtype=ml_dtype))
         return types
 
     def _coreml_outputs(self, spec: ComponentSpec) -> list:
@@ -872,9 +949,14 @@ class DoryConverter(BaseConverter):
         return [f"logits_{i}" for i in range(1, self.lm_head_splits + 1)]
 
     def states(self, wrapper) -> list:
-        """The state list: both cache buffers, in a fixed order, for every component."""
+        """The state list every component declares: one buffer per cache, in order.
+
+        dch.state_attrs derives the union from the config, so the untiled model
+        declares the same two buffers an untiled conversion always did, and a
+        tiled model declares one per tile plus the sliding cache.
+        """
         states = []
-        for attr in dch.STATE_ATTRS:
+        for attr in dch.state_attrs(self.config):
             buffer = getattr(wrapper.model, attr)
             states.append(ct.StateType(
                 name=f"model.{attr}",
@@ -1217,6 +1299,11 @@ class DoryConverter(BaseConverter):
                 print(f"  {spec.name:14s} {size / 1024 ** 2:8.0f} MB estimated"
                       f"  blocks={spec.blocks}  lut={self.lut_bits.get(spec.lut_role)}"
                       f"  calls/token={spec.calls_per_token}")
+            tiled, rope = tiling_flags(self.config)
+            print(f"  caches: {len(dch.state_attrs(self.config))} state(s), "
+                  f"tiles={list(dch.state_attrs(self.config)[:-1])}, "
+                  f"mask_len={int(self.config.mask_len)}")
+            print(f"  tiled={tiled}  rope_tables_as_inputs={rope}")
         for spec, size in plan:
             check_size(spec.name, size)
         disk = check_disk(nearest_existing(self.output_dir), plan)
@@ -1246,7 +1333,23 @@ class DoryConverter(BaseConverter):
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_config(model_path, context_length=None, batch_size=None, config=None):
+def parse_tile_rows(value):
+    """'16384,8192' -> (16384, 8192), or None for the untiled layout."""
+    if value in (None, "", "none", "None"):
+        return None
+    if isinstance(value, (tuple, list)):
+        return tuple(int(v) for v in value)
+    try:
+        rows = tuple(int(part) for part in str(value).replace(" ", "").split(",") if part)
+    except ValueError as exc:
+        raise SystemExit(f"not a tile layout: {value!r} (want rows like 16384,8192)") from exc
+    if not rows or any(row <= 0 for row in rows):
+        raise SystemExit(f"not a tile layout: {value!r} (every tile needs positive rows)")
+    return rows
+
+
+def build_config(model_path, context_length=None, batch_size=None, config=None,
+                 full_tile_rows=None, rope_tables_as_inputs=False):
     """DoryANEConfig from the model directory's config.json, with overrides."""
     model_path = Path(model_path)
     config_json = model_path / "config.json"
@@ -1255,6 +1358,11 @@ def build_config(model_path, context_length=None, batch_size=None, config=None):
         overrides["context_length"] = int(context_length)
     if batch_size is not None:
         overrides["batch_size"] = int(batch_size)
+    tiles = parse_tile_rows(full_tile_rows)
+    if tiles is not None:
+        overrides["full_cache_tiles"] = tiles
+    if rope_tables_as_inputs:
+        overrides["rope_tables_as_inputs"] = True
     if config is not None:
         return config
     if config_json.is_file():
@@ -1292,6 +1400,12 @@ def parse_args(argv=None):
     parser.add_argument("--no-compile", action="store_true", help="skip the .mlmodelc step")
     parser.add_argument("--only", default=None,
                         help="comma-separated component names (default: all)")
+    parser.add_argument("--full-tile-rows", default=None,
+                        help="split the full-attention caches into tiles (D7 fallback), "
+                             "e.g. '16384,8192'; unset keeps one cache per attention block")
+    parser.add_argument("--rope-tables-as-inputs", action="store_true",
+                        help="pass the RoPE cos/sin rows as graph inputs instead of tracing "
+                             "them as constants (24K: the tables are ~100 MB of constants)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the plan and the size estimates, convert nothing")
     return parser.parse_args(argv)
@@ -1299,7 +1413,9 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    config = build_config(args.model, args.context_length, args.batch_size)
+    config = build_config(args.model, args.context_length, args.batch_size,
+                          full_tile_rows=args.full_tile_rows,
+                          rope_tables_as_inputs=args.rope_tables_as_inputs)
     converter = DoryConverter(
         model_path=args.model, output_dir=args.output, config=config, prefix=args.prefix,
         lut_blocks=args.lut_blocks, lut_lm_head=args.lut_lm_head,
