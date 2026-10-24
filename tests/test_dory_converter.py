@@ -133,12 +133,16 @@ def test_recurrent_component_is_under_two_gigabytes_at_lut6(config, specs):
     recurrent = next(s for s in specs if s.name == "recurrent")
     size = dcv.estimate_component_bytes(recurrent, config, 6)
     assert size < dcv.MAX_MODEL_BYTES
-    assert size > 1.5 * 1024 ** 3
+    # calibrated: coremltools groups 16 weights per fp16 scale, so LUT6 costs
+    # 0.759 B/param and the 40-block recurrent component is ~1.35 GiB
+    assert size > 1.3 * 1024 ** 3
 
 
 def test_the_guard_fires_at_lut8_and_says_what_to_do(config, specs):
     recurrent = next(s for s in specs if s.name == "recurrent")
-    size = dcv.estimate_component_bytes(recurrent, config, 8)
+    # LUT8 is 1.89 GB once the estimate is calibrated, so it no longer trips the
+    # 2 GB guard; LUT12 does, which is the point of the guard.
+    size = dcv.estimate_component_bytes(recurrent, config, 12)
     with pytest.raises(dcv.ModelTooLargeError) as excinfo:
         dcv.check_size("recurrent", size)
     message = str(excinfo.value)
@@ -323,3 +327,57 @@ def test_component_model_only_builds_its_own_blocks(config):
     # the state buffers are the full 36-slot union regardless of the blocks
     assert model.model.kv_cache_full.shape[0] == 18
     assert model.model.kv_cache_sliding.shape[0] == 54
+
+
+def test_resume_defaults_off_and_can_be_enabled(config):
+    """Regression: convert_component read self.resume, which __init__ never set.
+
+    Every component conversion died with
+    AttributeError: 'DoryConverter' object has no attribute 'resume'.
+    """
+    converter = dcv.DoryConverter(model_path="/tmp/weights", output_dir="/tmp/out",
+                                  config=config, check_placement=False, verbose=False)
+    assert converter.resume is False
+    enabled = dcv.DoryConverter(model_path="/tmp/weights", output_dir="/tmp/out",
+                                config=config, check_placement=False, verbose=False,
+                                resume=True)
+    assert enabled.resume is True
+
+
+def test_finished_package_declines_what_it_cannot_verify(config, tmp_path):
+    converter = dcv.DoryConverter(model_path="/tmp/weights", output_dir=tmp_path,
+                                  config=config, check_placement=False, verbose=False)
+    spec = converter.spec("input")
+    assert converter._finished_package(spec, "prefill") is None
+
+    junk = tmp_path / converter.file_name(spec, "prefill")
+    junk.mkdir()
+    (junk / "Manifest.json").write_text("{}")
+    assert converter._finished_package(spec, "prefill") is None
+
+
+def test_finished_package_accepts_a_verified_package(config, tmp_path, monkeypatch):
+    """A package with the right size, one function and the right recorded name."""
+    converter = dcv.DoryConverter(model_path="/tmp/weights", output_dir=tmp_path,
+                                  config=config, lut_blocks=6, lut_lm_head=6,
+                                  lut_embeddings=None, lm_head_splits=8,
+                                  check_placement=False, verbose=False)
+    spec = converter.spec("lm_head")
+    package = tmp_path / converter.file_name(spec, "infer")
+    package.mkdir()
+    (package / "weight.bin").write_bytes(b"w" * 4096)
+
+    class FakeMetadata:
+        userDefined = {"com.anemll.functions": "infer"}
+
+    class FakeDescription:
+        functions: list = []
+        metadata = FakeMetadata()
+
+    class FakeProto:
+        description = FakeDescription()
+
+    monkeypatch.setattr(dcv, "estimate_component_bytes", lambda *a, **k: 4096)
+    monkeypatch.setattr("coremltools.models.utils.load_spec", lambda _path: FakeProto())
+    assert converter._finished_package(spec, "infer") == 4096
+    assert converter._finished_package(spec, "prefill") is None
