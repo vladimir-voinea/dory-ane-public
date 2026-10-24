@@ -183,6 +183,16 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     ids = np.loadtxt(Path(args.tokens), dtype=np.int64).reshape(-1).astype(np.int32)
+    largest = int(len(ids)) - 1
+    if not 0 <= int(args.start) < int(args.end) <= largest:
+        print(
+            f"error: the window [{args.start}, {args.end}) does not fit {len(ids):,} tokens. "
+            f"A window must satisfy 0 <= start < end <= {largest:,}: end - 1 is the last "
+            f"position a next token can be predicted for. Pass --tokens with a longer file "
+            f"(the reference's eval-tokens.txt is ~24K ids and allows end <= "
+            f"{24575:,} for a 24,576-token prompt), or a window inside this one.",
+            file=sys.stderr)
+        return 2
     if args.backend == "coreml":
         if not args.model_dir:
             print("error: --model-dir is required for the coreml backend", file=sys.stderr)

@@ -4,9 +4,21 @@ The gate needs log-probabilities at absolute positions 16,384+ of a ~24K prompt.
 A llama-perplexity run split into contexts cannot supply them: each context is
 prefilled from position 0, so a chunk "beyond 16K" of the text still sits at
 relative positions 0..ctx-1.  The only layout that measures what the gate means is
-**one context of the whole prompt with one ubatch** -- a single full prefill whose
-positions are the absolute ones, and whose scored rows are the second half,
-12,288..24,575, which contains the window of interest.
+one context of the whole prompt, whose scored rows are the second half,
+12,288..24,574, which contains the window of interest.
+
+WHAT THIS ARTIFACT IS, exactly (the numbers are in the sidecar too):
+
+  kv_cache_mode  last_loop      the cache semantics the decode gate measures
+  batching       full (default) one prefill of the whole context, one ubatch
+                 decode           one token per step -- the candidate's own shape
+
+A full prefill is exact-mode *batching*, not decode-mode batching, so this is not
+the same artifact as DANE-2's 4K bf16_decode_loop2.kld.  It is the right yardstick
+anyway: at 4K the gap between the exact and the decode reference is 0.0028-0.0069
+KLD at two loops, two orders of magnitude below the 0.05 gate, so the batching
+cannot move a verdict.  Pass --mode decode if you ever want the strict decode-batched
+reference (24,574 sequential steps on the GPU).
 
 That is DANE-2's own generator, called with ctx = the full text length and
 chunks = 1; this script is a thin wrapper so nothing about that code path is
@@ -72,6 +84,7 @@ def build(args) -> dict:
     from anemll.eval.kld import read_llama_cpp_kld, scored_positions
 
     ctx = int(args.ctx)
+    name = args.name
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     text = Path(args.text) if args.text else None
@@ -80,15 +93,16 @@ def build(args) -> dict:
     else:
         print(f"[{name}] using {text} ({text.stat().st_size} bytes)", flush=True)
 
-    name = args.name
     out = out_dir / f"{name}.kld"
     meta_path = out.with_suffix(out.suffix + ".meta.json")
     if out.is_file() and meta_path.is_file() and not args.force:
         print(f"[{name}] exists, skipping (use --force)", flush=True)
     else:
+        batching = "full" if args.mode == "full" else "decode"
+        n_batch = ctx if batching == "full" else max(1, int(args.decode_batch))
         info = mkref.run_llama_perplexity(
             Path(args.llama_perplexity), Path(args.gguf), text, out,
-            "decode", int(args.loops), ctx, ctx=ctx, chunks=1)
+            "decode", int(args.loops), n_batch, ctx=ctx, chunks=1)
         source = read_llama_cpp_kld(out)
         tokens = np.asarray(source.tokens, dtype=np.int32)
         rows = scored_positions(1, ctx)
@@ -104,11 +118,17 @@ def build(args) -> dict:
             "mode": "decode",
             "loops": int(args.loops),
             "kv_cache_mode": "last_loop",
-            "n_batch": ctx,
-            "n_ubatch": mkref.ubatch_for("decode", ctx, ctx),
+            "n_batch": n_batch,
+            "n_ubatch": mkref.ubatch_for("decode", n_batch, ctx),
             "chunk_size": ctx,
             "n_chunks": 1,
-            "layout": "one context, one ubatch: absolute positions, no restart",
+            "batching": batching,
+            "layout": ("one context, one full prefill: absolute positions, no restart"
+                       if batching == "full" else
+                       "one context, one token per step: absolute positions, decode batching"),
+            "note": ("kv mode is last_loop (the decode gate's semantics); the batching is "
+                     "full-context.  At 4K the exact-vs-decode reference gap is 0.0028-0.0069 "
+                     "KLD at two loops, far below the 0.05 gate."),
             "n_rows": int(source.n_rows),
             "scored_positions": [int(covered[0]), int(covered[1])],
             "tokens_file": "eval-tokens.txt",
@@ -126,7 +146,7 @@ def build(args) -> dict:
     meta = json.loads(meta_path.read_text())
     print(json.dumps({key: meta[key] for key in
                       ("name", "n_rows", "scored_positions", "tokens", "perplexity",
-                       "seconds")}, indent=2))
+                       "batching", "n_batch", "n_ubatch", "seconds")}, indent=2))
     return meta
 
 
@@ -136,7 +156,7 @@ def parse_args(argv=None):
     parser.add_argument("--gguf", required=True, help="BF16 GGUF")
     parser.add_argument("--llama-perplexity", required=True)
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--name", default="bf16_decode_abs24k_loop2")
+    parser.add_argument("--name", default="bf16_lastloop_fullprefill_abs24k_loop2")
     parser.add_argument("--ctx", type=int, default=24576)
     parser.add_argument("--loops", type=int, default=2)
     parser.add_argument("--text", default=None, help="an existing ~ctx-token text file")
@@ -144,6 +164,12 @@ def parse_args(argv=None):
                         help="text to repeat when --text is not given")
     parser.add_argument("--start", type=int, default=16384)
     parser.add_argument("--end", type=int, default=18432)
+    parser.add_argument("--mode", choices=("full", "decode"), default="full",
+                        help="'full' prefills the whole context in one ubatch (exact-mode "
+                             "batching, the default and the yardstick); 'decode' walks one "
+                             "token per step, which is 24,574 sequential steps")
+    parser.add_argument("--decode-batch", type=int, default=1,
+                        help="ubatch for --mode decode")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
 
