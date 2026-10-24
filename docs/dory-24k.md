@@ -161,11 +161,20 @@ with up to ten attempts; the artifact records how many it took, each attempt's
 error text, and the load average and swap at every attempt.  A run that never
 completed reports `inconclusive`, never a pass.
 
-One consequence worth stating plainly: the converter's own gate,
-`assert_ane_only`, fails when the plan attributes no ANE operation to any op --
-which is exactly what this host returns for every model.  A 24K conversion here
-needs `--no-placement-check`, and the latency pair above is what stands in its
-place.  That is a policy decision, recorded rather than papered over.
+The converter's own gate now draws the same distinction, because conflating the
+two is how a tool failure becomes a silent pass:
+
+| the plan says | outcome | what the conversion does |
+|---|---|---|
+| an op is on the CPU or the GPU | `FAILED` | stops with PlacementError; the model is misplaced |
+| nothing is attributed to any op | `UNMEASURED` | stops with PlacementUnmeasurable unless `--accept-unmeasurable-placement` is given, and then records UNMEASURED in the meta and the report |
+| every attributed op on the ANE | `MEASURED` | proceeds; the unattributed count travels with it |
+| the gate was not run | `SKIPPED` | proceeds, recorded as skipped |
+
+A mixed report (some ops attributed, some `other`) is judged on the attributed
+ones and reports how many were unattributed; it never counts the unattributed ops
+as ANE.  UNMEASURED is a distinct gate word, and the meta's `placement.reason`
+says in one sentence that it is not a placement claim.
 
 ## Status of the placement evidence (2026-10-24 07:10)
 

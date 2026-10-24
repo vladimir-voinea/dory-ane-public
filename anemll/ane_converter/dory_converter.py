@@ -51,6 +51,9 @@ __all__ = [
     "MAX_MODEL_BYTES",
     "ModelTooLargeError",
     "PlacementError",
+    "PlacementUnmeasurable",
+    "classify_placement",
+    "placement_summary",
     "MetaError",
     "ComponentSpec",
     "component_specs",
@@ -95,6 +98,19 @@ class ModelTooLargeError(RuntimeError):
 
 class PlacementError(RuntimeError):
     """A converted op did not land on the Neural Engine."""
+
+
+class PlacementUnmeasurable(PlacementError):
+    """The toolchain attributed no device to any operation.
+
+    Deliberately a distinct type from its parent: PlacementError means the model
+    is misplaced (an op runs on the CPU or the GPU), which is what the gate exists
+    to catch; PlacementUnmeasurable means the tool could not tell, which on this
+    host (macOS 27.2, coremltools 8.3) is every model -- MLComputePlan attributes
+    everything to 'other' and cannot plan a stateful graph at all.  It is a
+    failure of the tool, not of the model, and it is never a pass: a conversion
+    that hits it stops unless the caller explicitly accepts unmeasured placement.
+    """
 
 
 class MetaError(ValueError):
@@ -415,7 +431,7 @@ def _state_descriptions(config) -> list:
 def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="dory",
                argmax=False, tokenizer="tokenizer.json",
                chat_template="chat_template.jinja", bos_token_id=1, eos_token_id=11,
-               eos_token_ids=(2, 11), created=None) -> dict:
+               eos_token_ids=(2, 11), created=None, placement=None) -> dict:
     """The meta file: context, chunk layout, LUT widths, KV mode, loop range,
     tokenizer and chat template.
 
@@ -533,6 +549,12 @@ def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="d
             "eos_token_id": int(eos_token_id),
             "eos_token_ids": [int(t) for t in eos_token_ids],
         },
+        "placement": placement or {
+            "gate": "SKIPPED",
+            "reason": "the conversion recorded no placement check",
+            "unattributed_ops": 0,
+            "components": {},
+        },
         "components": components,
         "run_order": [spec.name for spec in specs],
     }
@@ -643,6 +665,17 @@ def validate_meta(meta) -> list:
          "tokenizer.chat_template must be present (a file name, or null with a fallback)")
     need(bool(tokenizer.get("chat_template")) or bool(tokenizer.get("chat_template_fallback")),
          "either tokenizer.chat_template or tokenizer.chat_template_fallback is required")
+
+    placement = meta.get("placement") or {}
+    need(placement.get("gate") in ("MEASURED", "UNMEASURED", "SKIPPED", "FAILED"),
+         f"placement.gate must be MEASURED, UNMEASURED, SKIPPED or FAILED, got "
+         f"{placement.get('gate')!r}")
+    need(bool(placement.get("reason")),
+         "placement.reason must say in one sentence what the gate concluded")
+    if placement.get("gate") == "UNMEASURED":
+        need("not a pass" in str(placement.get("reason")).lower()
+             or "could not be measured" in str(placement.get("reason")).lower(),
+             "a placement recorded as UNMEASURED must say that it is not a placement claim")
 
     components = meta.get("components") or {}
     order = meta.get("run_order") or []
@@ -789,29 +822,107 @@ def placement_report(model_path) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def classify_placement(report: dict) -> dict:
+    """Judge a compute-plan report as failed, unmeasurable, or measured.
+
+    Three outcomes, because there are three situations and conflating them is how
+    a tool failure turns into a silent pass:
+
+      failed        at least one op is attributed to the CPU or the GPU -- the
+                    model is misplaced, and that is what the gate refuses.
+      unmeasurable  nothing is attributed at all (every op 'other', or no ops):
+                    the toolchain cannot answer, so the gate has no verdict.
+      measured      every attributed op is on the ANE; the unattributed count is
+                    reported rather than ignored.
+    """
+    total = sum(int(counts.get("ops", 0)) for counts in report.values())
+    unattributed = sum(int(counts.get("none", 0)) for counts in report.values())
+    off = {name: counts for name, counts in report.items()
+           if int(counts.get("gpu", 0)) or int(counts.get("cpu", 0))}
+    attributed = total - unattributed
+    if off:
+        outcome = "failed"
+    elif attributed == 0:
+        outcome = "unmeasurable"
+    else:
+        outcome = "measured"
+    return {
+        "outcome": outcome,
+        "total_ops": total,
+        "attributed_ops": attributed,
+        "unattributed_ops": unattributed,
+        "offending": {name: {"gpu": int(counts.get("gpu", 0)),
+                             "cpu": int(counts.get("cpu", 0))}
+                      for name, counts in off.items()},
+        "ane_ops": sum(int(counts.get("ane", 0)) for counts in report.values()),
+    }
+
+
+def placement_summary(placement: dict) -> dict:
+    """The conversion-level placement block for meta and the report.
+
+    The gate word is upper case and there is no way for 'unmeasured' to render as
+    a pass: the four states are MEASURED, UNMEASURED, SKIPPED and FAILED, and the
+    unattributed op count travels with them.
+    """
+    outcomes = [entry.get("outcome") for by_function in (placement or {}).values()
+                for entry in by_function.values()]
+    unattributed = sum(int(entry.get("unattributed_ops") or 0)
+                       for by_function in (placement or {}).values()
+                       for entry in by_function.values())
+    if "failed" in outcomes:
+        gate = "FAILED"
+        reason = ("at least one converted operation is attributed to the CPU or the GPU; "
+                  "the spec requires every operation on the Neural Engine")
+    elif "unmeasurable" in outcomes:
+        gate = "UNMEASURED"
+        reason = (f"the compute plan attributed no device to any of its operations "
+                  f"({unattributed} unattributed), so placement could not be measured on "
+                  f"this toolchain; this is not a pass and not a placement claim")
+    elif outcomes and all(outcome == "measured" for outcome in outcomes):
+        gate = "MEASURED"
+        reason = "every attributed operation is on the Neural Engine"
+    else:
+        gate = "SKIPPED"
+        reason = "the placement gate was not run for this conversion"
+    return {
+        "gate": gate,
+        "reason": reason,
+        "unattributed_ops": unattributed,
+        "components": {name: [entry.get("outcome") for entry in by_function.values()]
+                       for name, by_function in (placement or {}).items()},
+    }
+
+
 def assert_ane_only(report: dict, label: str) -> dict:
     """Fail unless every function runs its ops on the Neural Engine.
 
-    Two ways to fail, both of them hard: an op attributed to the GPU or the CPU,
-    and a function the compute plan attributed no device to (ane + gpu + cpu ==
-    0).  An empty attribution is not evidence of placement, so it must never
-    read as a pass.
+    Three outcomes, and the distinction is the point (see classify_placement): an
+    op attributed to the GPU or the CPU raises PlacementError -- the model is
+    misplaced; an attribution that names no device at all raises
+    PlacementUnmeasurable -- the tool cannot answer, which is never a pass; and a
+    report whose attributed ops are all on the ANE passes, with its unattributed
+    count returned alongside the report for the caller to record.
     """
-    def offending(counts) -> bool:
-        return bool(counts["gpu"] or counts["cpu"]) or not counts["ane"]
-
-    bad = {fn: counts for fn, counts in report.items() if offending(counts)}
+    status = classify_placement(report)
+    if status["outcome"] == "unmeasurable":
+        raise PlacementUnmeasurable(
+            f"{label}: the compute plan attributed no device to any of "
+            f"{status['total_ops']} operations, so placement cannot be measured with "
+            f"this toolchain (MLComputePlan reports 'other' for every op on this host "
+            f"and cannot plan a stateful model).  This is not a pass; convert with "
+            f"--accept-unmeasurable-placement to proceed with unmeasured placement, or "
+            f"use latency evidence for the placement question")
+    bad = status["offending"]
     if not bad:
         return report
     lines = []
-    for fn, counts in bad.items():
-        if counts["ane"] or counts["gpu"] or counts["cpu"]:
-            lines.append(f"{fn}: {counts['ane']} ANE, {counts['gpu']} GPU, "
-                         f"{counts['cpu']} CPU")
-        else:
-            lines.append(f"{fn}: the compute plan attributed no device to any of "
-                         f"{counts['ops']} operations")
-        for op in counts["fallbacks"][:20]:
+    for fn in sorted(bad):
+        counts = report[fn]
+        lines.append(f"{fn}: {counts.get('ane', 0)} ANE, {counts.get('gpu', 0)} GPU, "
+                     f"{counts.get('cpu', 0)} CPU, {counts.get('none', 0)} unattributed "
+                     f"of {counts.get('ops', 0)}")
+        for op in (counts.get("fallbacks") or [])[:20]:
             lines.append(f"  - {op}")
     raise PlacementError(
         f"{label} has operations off the Neural Engine (spec gate: every op on "
@@ -856,7 +967,7 @@ class DoryConverter(BaseConverter):
                  lut_blocks=6, lut_lm_head=6, lut_embeddings=None,
                  lut_per_channel=8, lm_head_splits=8, recurrent_splits=1,
                  argmax=False, check_placement=True, verbose=True,
-                 resume=False):
+                 resume=False, accept_unmeasurable_placement=False):
         super().__init__(model=None)
         self.model_path = Path(model_path)
         self.output_dir = Path(output_dir)
@@ -882,7 +993,12 @@ class DoryConverter(BaseConverter):
         from anemll.models.dory_chunks import lm_head_split_sizes
         self.lm_head_chunk_sizes = lm_head_split_sizes(self.config.vocab_size,
                                                        self.lm_head_splits)
+        #: proceed when the toolchain cannot measure placement at all.  Off by
+        #: default: an unmeasured placement is never a pass, so it takes an
+        #: explicit decision by the caller and is recorded as UNMEASURED.
+        self.accept_unmeasurable_placement = bool(accept_unmeasurable_placement)
         self.placement: dict = {}
+        self.unmeasured: list = []
         self.sizes: dict = {}
         self.seconds: dict = {}
 
@@ -1156,15 +1272,36 @@ class DoryConverter(BaseConverter):
 
     def _gate_placement(self, spec: ComponentSpec, out_path: Path,
                         function: str = None) -> None:
-        """The spec's placement gate: refuse a package that is not all on the ANE."""
+        """The spec's placement gate, with the tool's incapacity kept separate.
+
+        A package the plan places on the CPU or the GPU is refused outright.  A
+        plan that attributes nothing at all stops the conversion too, unless the
+        caller asked for unmeasured placement with --accept-unmeasurable-placement,
+        in which case the component is recorded as UNMEASURED (meta and report)
+        and the run continues with a warning that says exactly that.
+        """
         label = f"{spec.name}/{function}" if function else spec.name
         if not self.check_placement_gate:
             print(f"WARNING: placement gate skipped for {label}; the spec "
                   f"requires every op on the Neural Engine", file=sys.stderr)
+            self.placement.setdefault(spec.name, {})[function or "main"] = {
+                "outcome": "skipped", "reason": "the gate was not run"}
             return
         report = placement_report(out_path)
-        self.placement.setdefault(spec.name, {})[function or "main"] = report
-        assert_ane_only(report, f"{label} ({out_path.name})")
+        status = classify_placement(report)
+        self.placement.setdefault(spec.name, {})[function or "main"] = {
+            **status, "report": report}
+        try:
+            assert_ane_only(report, f"{label} ({out_path.name})")
+        except PlacementUnmeasurable as error:
+            if not self.accept_unmeasurable_placement:
+                raise
+            self.unmeasured.append(label)
+            print(f"WARNING: placement UNMEASURED for {label} -- {status['total_ops']} "
+                  f"operations, none attributed to a device.  The conversion continues "
+                  f"because --accept-unmeasurable-placement was given; the meta and the "
+                  f"report record UNMEASURED, never a pass.", file=sys.stderr)
+            del error
 
     def _functions(self, spec: ComponentSpec) -> list:
         """(function_name, sequence_length) pairs this component provides."""
@@ -1323,7 +1460,8 @@ class DoryConverter(BaseConverter):
             prefix=self.prefix, argmax=self.argmax,
             tokenizer="tokenizer.json",
             chat_template=("chat_template.jinja" if "chat_template.jinja" in copied
-                           else None))
+                           else None),
+            placement=placement_summary(self.placement))
         yaml_path = write_meta(self.output_dir / "meta.yaml", meta)
         report_path = self.write_report(meta, copied)
         return {"meta": str(yaml_path), "report": str(report_path)}
@@ -1331,6 +1469,7 @@ class DoryConverter(BaseConverter):
     def write_report(self, meta: dict, tokenizer_files: list) -> Path:
         """conversion_report.json: sizes, timings and per-function placement."""
         report = {
+            "placement": placement_summary(self.placement),
             "components": {name: {
                 "bytes": {fn: self.sizes.get(f"{name}:{fn}") for fn in meta["components"][name]["files"]},
                 "seconds": self.seconds.get(name),
@@ -1475,6 +1614,10 @@ def parse_args(argv=None):
                         help="return local argmax indices from the LM head instead of logits")
     parser.add_argument("--no-placement-check", action="store_true",
                         help="skip the per-function ANE placement gate (never do this for a gate)")
+    parser.add_argument("--accept-unmeasurable-placement", action="store_true",
+                        help="proceed when the toolchain cannot measure placement at all (the "
+                             "compute plan attributes nothing); the meta and the report record "
+                             "UNMEASURED, never a pass")
     parser.add_argument("--no-compile", action="store_true", help="skip the .mlmodelc step")
     parser.add_argument("--only", default=None,
                         help="comma-separated component names (default: all)")
@@ -1499,13 +1642,17 @@ def main(argv=None) -> int:
         lut_blocks=args.lut_blocks, lut_lm_head=args.lut_lm_head,
         lut_embeddings=args.lut_embeddings, lut_per_channel=args.lut_per_channel,
         lm_head_splits=args.lm_head_splits, recurrent_splits=args.recurrent_splits,
-        argmax=args.argmax, check_placement=not args.no_placement_check)
+        argmax=args.argmax, check_placement=not args.no_placement_check,
+        accept_unmeasurable_placement=args.accept_unmeasurable_placement)
     try:
         result = converter.run(only=args.only, dry_run=args.dry_run,
                                do_compile=not args.no_compile)
     except ModelTooLargeError as exc:
         print(f"stopped: {exc}", file=sys.stderr)
         return 2
+    except PlacementUnmeasurable as exc:
+        print(f"placement UNMEASURED: {exc}", file=sys.stderr)
+        return 4
     except PlacementError as exc:
         print(f"placement gate failed: {exc}", file=sys.stderr)
         return 3
