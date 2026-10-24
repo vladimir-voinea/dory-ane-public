@@ -13,18 +13,51 @@ path except the tile fallback, which is a configuration of the same module.
 | total state | | | **999 MiB** |
 | mask input | | `(1, 1, q_len, 25664)` fp16 | 51 KiB per decode step |
 
+### How those bytes are cut into states (measured)
+
+A single `(18, 4, 24576, 256)` state is 864 MiB and the Neural Engine will not
+take it: **the per-state ceiling is about 24 MiB (32 MiB fails), and a package can
+carry about 56-63 states**.  The 24K layout therefore splits the caches along the
+head axis and groups the sliding slots:
+
+| states | each | MiB each | total |
+|---|---|---|---|
+| 36 full-attention states, one per (layer, head) | `(2, 1, 24576, 256)` | 24.0 | 864 |
+| 9 sliding carriers, three layer-slots each | `(6, 4, 1280, 256)` | 15.0 | 135 |
+| **45 states** | | largest **24.0** | **999** |
+
+Measured, not projected: the v18 build loads and predicts on `CPU_AND_NE` at
+exactly these shapes.  27 sliding slots do not divide into six carriers of 22.5 MiB
+(that would be 4.5 slots per carrier), which is why there are nine carriers of
+three slots rather than six.  Both ceilings are per state and per package, so the
+count and the size are separate risks: 45 states at most 24.0 MiB is inside both.
+
 `context_length` is the number of rows of a full-attention cache and the number of
 positions the caches can address; the sliding cache is
 `PAD(min(ctx, window + batch), 256) = 1,280` rows, the same sizing llama.cpp uses
 (llama-kv-cache-iswa.cpp:69-105), so a 64-token batch never straddles the ring
 seam (`1,280 % 64 == 0`, and prefill batches start on multiples of 64).
 
-## The tile fallback (spec D7)
+## The tile fallback (spec D7) -- superseded at 24K, kept as a documented fallback
 
-A 24,576-row state is above ANEMLL's documented 16,384-axis guidance, so the spec
-says: if it does not stay on the ANE inside the real chunks, split each full
-cache into a 16,384-row and an 8,192-row tile and merge the two attention
-partials with a log-sum-exp combine.
+**Decision (2026-10-25, measured): the 24K path ships UNTILED**, with the
+per-(layer, head) states above.  The tiles were invented for a per-state *byte*
+problem, and the head axis solves that problem on the right axis: 45 states, the
+largest 24.0 MiB, loads and predicts.  The tiles remain in the tree for a context
+where a single state **cannot be split by head**, and for nothing else at 24K.
+
+They do not compose with the head axis, and that is arithmetic, not opinion: the
+state count is `len(tiles) x 36` full states regardless of where the rows are
+cut, so the 16,384 + 8,192 fallback gives 72 full states + 9 sliding carriers = 81,
+and even the smallest two-way cut gives 72 + 9.  Both are over the measured ~56-63
+state ceiling, so a tiled 24K package built on top of the head split would refuse
+to load -- the very failure the tiles were meant to prevent.  The converter raises
+when both are requested, and that guard is the correct behaviour: it stops a
+78-state package from being built at all.
+
+For the record, the fallback itself: if it does not stay on the ANE inside the real
+chunks, split each full cache into a 16,384-row and an 8,192-row tile and merge
+the two attention partials with a log-sum-exp combine.
 
 That is `full_cache_tiles = (16384, 8192)`:
 
@@ -90,9 +123,11 @@ prints it as one line and exits 2 — never a traceback, never silent truncation
 ## Gate commands (heavy: run in an exclusive window)
 
 ```bash
-# 1. the D7 decision: one 24,576-row cache or the 16,384 + 8,192 tiles.
-#    Latency evidence (CPU_ONLY vs CPU_AND_NE) plus the raw compute plan; the
-#    probe retries in fresh processes because this host's stateful path is flaky.
+# 1. the D7 question, now decided UNTILED -- so this probe confirms the single
+#    24,576-row cache is on the ANE, with latency evidence (CPU_ONLY vs
+#    CPU_AND_NE) plus the raw compute plan.  The tiled variant is kept for
+#    reference only: it does not compose with the per-head states (81 states).
+#    The probe retries in fresh processes: this host's stateful path is flaky.
 python scripts/dory_24k_placement_probe.py --model <bf16> --out <out>/probe-24k.json
 python scripts/dory_24k_placement_probe.py --model <bf16> \
     --full-tile-rows 16384,8192 --out <out>/probe-24k-tiled.json
@@ -114,7 +149,8 @@ python -m anemll.dory_chat bench --model-dir <out> --context 24576 --loops 2 \
 
 | gate | threshold | measured |
 |---|---|---|
-| the 24,576-row cache (or the tiles) keeps the ANE: latency evidence, CPU_ONLY vs CPU_AND_NE on one chunk | CPU_AND_NE materially faster (ratio >= 1.5), raw plan attached | *pending the exclusive window* |
+| the 24K chunk loads and predicts on the ANE at all (45 states, largest 24.0 MiB) | a load + one predict under CPU_AND_NE | **measured: the v18 build loads and predicts** |
+| the 24K chunk runs on the ANE rather than falling back to the CPU: latency evidence, CPU_ONLY vs CPU_AND_NE on the probe chunk | CPU_AND_NE materially faster (ratio >= 1.5), raw plan attached | *pending the exclusive window* |
 | six codes at depths 0..24K, 2 loops | all six | *pending* |
 | decode-mode KLD on windows beyond 16K, 2 loops | mean KLD <= 0.05, top-1 >= 93 % | *pending* |
 | decode at 24K, 2 loops | >= 8 tok/s (below 6: stop and report) | *pending* |
@@ -124,14 +160,18 @@ python -m anemll.dory_chat bench --model-dir <out> --context 24576 --loops 2 \
 ## Known risks
 
 * The mask input is one tensor of width `context_length + sliding_rows` = 25,664,
-  above the 16,384-axis guidance.  If the placement gate blames it, the next step
-  is per-tile mask inputs (the mask is already split per tile internally, so the
-  change is the chunk's input list, not the math).
-* A tiled conversion doubles the number of state buffers every component declares
-  (three instead of two); the union-of-states rule still holds because all five
-  components read the same `state_attrs(config)`.
-* 999 MiB of state plus the chunk weights must fit next to whatever else the
-  machine is doing; the benchmark reports the process's peak RSS.
+  above the 16,384-axis guidance.  It is an input, not a state, so the per-state
+  ceiling does not apply to it; if a chunk still refuses to load, the next step is
+  a narrower mask (the mask is already split per tile internally, so the change is
+  the chunk's input list, not the math).
+* 999 MiB of state across 45 states plus the chunk weights must fit next to
+  whatever else the machine is doing; the benchmark reports the process's peak
+  RSS.  The state count (45 of ~56-63) and the largest state (24.0 of ~24 MiB) are
+  both close enough to their ceilings that a tiled conversion would break the
+  count and a coarser head split would break the size.
+* The union-of-states rule still holds and is now load-bearing: every component
+  declares the same 45 buffers because they all read `state_attrs(config)`, and a
+  component that disagreed by one name would refuse to share the state object.
 
 
 ## What "placement" means on this host (2026-10-24 17:05)
