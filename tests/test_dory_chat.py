@@ -27,7 +27,9 @@ def fake_config():
 def fake_meta(**overrides):
     config = fake_config()
     specs = dcv.component_specs(config)
-    files = {spec.name: spec.name + ".mlpackage" for spec in specs}
+    files = {spec.name: {function: f"{spec.name}_{function}.mlpackage"
+                         for function in ("infer", "prefill")}
+             for spec in specs}
     sizes = [VOCAB // 2, VOCAB // 2]
     kwargs = dict(config=config, specs=specs, files=files,
                   lut_bits={"embeddings": None, "blocks": 6, "lm_head": 6},
@@ -142,7 +144,9 @@ def test_block_components_run_in_order_with_the_recurrent_one_in_the_middle():
 def test_split_recurrent_runs_both_halves_every_loop():
     config = fake_config()
     specs = dcv.component_specs(config, recurrent_splits=2)
-    files = {spec.name: spec.name + ".mlpackage" for spec in specs}
+    files = {spec.name: {function: f"{spec.name}_{function}.mlpackage"
+                         for function in ("infer", "prefill")}
+             for spec in specs}
     meta = dcv.build_meta(config=config, specs=specs, files=files,
                           lut_bits={"embeddings": None, "blocks": 6, "lm_head": 6},
                           lm_head_chunk_sizes=[VOCAB // 2, VOCAB // 2], chat_template=None)
@@ -332,12 +336,11 @@ def test_chatml_fallback_carries_a_system_prompt():
 # -- loading ---------------------------------------------------------------
 
 def test_resolve_model_path_falls_back_to_the_package(tmp_path):
-    (tmp_path / "dory_input_lut6.mlpackage").mkdir()
-    entry = {"file": "dory_input_lut6.mlmodelc"}
-    resolved = chat.resolve_model_path(tmp_path, entry)
+    (tmp_path / "dory_input_lut6_infer.mlpackage").mkdir()
+    resolved = chat.resolve_model_path(tmp_path, "dory_input_lut6_infer.mlmodelc")
     assert resolved.suffix == ".mlpackage"
 
 
 def test_resolve_model_path_reports_a_missing_component(tmp_path):
     with pytest.raises(FileNotFoundError, match="dory_input"):
-        chat.resolve_model_path(tmp_path, {"file": "dory_input_lut6.mlpackage"})
+        chat.resolve_model_path(tmp_path, "dory_input_lut6_infer.mlpackage")

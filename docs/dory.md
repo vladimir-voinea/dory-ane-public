@@ -13,18 +13,26 @@ what the meta file records, and how to run and measure them.
 
 ## The five components (spec D6)
 
-| Component | Blocks | Called per token | File |
+| Component | Blocks | Called per token | Files (one per function) |
 |---|---|---|---|
-| embeddings | token embedding | once | `dory_embeddings[_lutN].mlmodelc` |
-| input | 0-15 | once | `dory_input_lut6.mlmodelc` |
-| recurrent | 16-55 | **N times** (loop count) | `dory_recurrent_lut6.mlmodelc` |
-| output | 56-71 | once | `dory_output_lut6.mlmodelc` |
-| LM head | `lm_head`, split into 8 x 16,384 | once | `dory_lm_head_lut6.mlmodelc` |
+| embeddings | token embedding | once | `dory_embeddings[_lutN]_{infer,prefill}.mlmodelc` |
+| input | 0-15 | once | `dory_input_lut6_{infer,prefill}.mlmodelc` |
+| recurrent | 16-55 | **N times** (loop count) | `dory_recurrent_lut6_{infer,prefill}.mlmodelc` |
+| output | 56-71 | once | `dory_output_lut6_{infer,prefill}.mlmodelc` |
+| LM head | `lm_head`, split into 8 x 16,384 | once | `dory_lm_head_lut6_{infer,prefill}.mlmodelc` |
 
-Each file is multifunction: `infer` (one token) and `prefill` (64 tokens),
-built as two traces of the same weights and welded with
-`MultiFunctionDescriptor` plus ANEMLL's weight dedup, so the two functions share
-one copy of the weights.
+**One package per function, not multifunction.** ANEMLL welds `infer` and
+`prefill` into one multifunction package; that does not work on this macOS build.
+`ct.utils.save_multifunction` plus `coremlcompiler` accept the package (rc 0), but
+the compiled model has no `Manifest.json` and every load path --
+`ct.models.MLModel`, `ct.models.CompiledMLModel`, `MLComputePlan` -- answers "This
+MLModel doesn't support the multi-function description sytnax." When
+`CompiledMLModel` does open one, `.functionName` is refused ("must be nil unless the
+model type supports functions") and only the default function survives, so the
+prefill graph is silently gone. Ten honest single-function packages are what
+this port therefore ships: the cost is a second copy of each component's weights
+on disk (about 8.6 GB at 1K context and LUT6 instead of 4.3 GB), and every file
+stays well under the 2 GB limit.
 
 The block ranges come from Dory's structure, not from ANEMLL's balanced split
 (`llama_converter.py:761-768`): an even split would cut through the recurrent
@@ -71,7 +79,7 @@ more, so `meta.yaml` adds (with `dory_meta: 1` as the schema version):
   `context_length` rows, 27 sliding caches of
   `PAD(min(ctx, window + batch), 256)` rows);
 - `loops: {min: 1, max: 4, default: 2}` -- the supported loop range;
-- `components.<name>`: file, functions, block range, `calls_per_token` (`1` or
+- `components.<name>`: a `files` mapping (function -> package), the function list, (`1` or
   `loops`), LUT width, inputs and outputs -- so the runtime does not hardcode five
   paths;
 - `tokenizer`: the tokenizer file, the chat template (or

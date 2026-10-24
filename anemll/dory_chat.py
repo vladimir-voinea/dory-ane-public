@@ -49,9 +49,9 @@ def _coreml():
     return ct
 
 
-def resolve_model_path(model_dir: Path, entry: dict) -> Path:
+def resolve_model_path(model_dir: Path, file_name: str) -> Path:
     """The file the meta names, or its sibling if only the other form exists."""
-    path = Path(model_dir) / entry["file"]
+    path = Path(model_dir) / file_name
     if path.exists():
         return path
     for suffix in (".mlpackage", ".mlmodelc"):
@@ -62,28 +62,22 @@ def resolve_model_path(model_dir: Path, entry: dict) -> Path:
                             f"exists in {model_dir}")
 
 
-def load_function(path: Path, function_name: str, compute_units=None):
-    """Load one function of one component.
+def load_function(path: Path, function_name: str = None, compute_units=None):
+    """Load one package, which holds exactly one function.
 
-    A multifunction .mlmodelc cannot always be told which function to use, so a
-    compiled package falls back to the .mlpackage beside it, which Core ML will
-    compile on first load (that first load is what the compile-cache gate
-    measures).  Mirrors ANEMLL tests/chat.py:382-470.
+    Dory ships one package per function (infer and prefill separately): welded
+    multifunction packages are rejected by this macOS build, so there is no
+    function to select here.  function_name is kept only so call sites read
+    clearly.  A .mlmodelc is the cached compile; a .mlpackage is compiled by
+    Core ML on first load.
     """
     ct = _coreml()
     if compute_units is None:
         compute_units = ct.ComputeUnit.CPU_AND_NE
     path = Path(path)
     if path.suffix == ".mlmodelc":
-        try:
-            return ct.models.CompiledMLModel(str(path), compute_units,
-                                             function_name=function_name)
-        except Exception:
-            package = path.with_suffix(".mlpackage")
-            if not package.exists():
-                raise
-            return ct.models.MLModel(str(package), function_name=function_name)
-    return ct.models.MLModel(str(path), function_name=function_name)
+        return ct.models.CompiledMLModel(str(path), compute_units)
+    return ct.models.MLModel(str(path))
 
 
 class DoryRuntime:
@@ -110,14 +104,13 @@ class DoryRuntime:
     def _load_models(self):
         for name in self.meta["run_order"]:
             entry = self.meta["components"][name]
-            path = resolve_model_path(self.model_dir, entry)
-            self.models[name] = {
-                fn: load_function(path, fn, self.compute_units)
-                for fn in entry["functions"]
-            }
-            if self.verbose:
-                print(f"loaded {name}: {path.name} ({', '.join(entry['functions'])})",
-                      file=sys.stderr)
+            loaded = {}
+            for function in entry["functions"]:
+                path = resolve_model_path(self.model_dir, entry["files"][function])
+                loaded[function] = load_function(path, None, self.compute_units)
+                if self.verbose:
+                    print(f"loaded {name}/{function}: {path.name}", file=sys.stderr)
+            self.models[name] = loaded
 
     @property
     def state_owner(self) -> str:

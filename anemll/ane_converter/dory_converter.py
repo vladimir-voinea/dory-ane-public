@@ -336,7 +336,7 @@ def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="d
         bits = lut_bits.get(spec.lut_role)
         entry = {
             "kind": spec.kind,
-            "file": files[spec.name],
+            "files": dict(files[spec.name]),
             "functions": ["infer", "prefill"] if batch > 1 else ["infer"],
             "calls_per_token": spec.calls_per_token,
             "lut": _lut_value(bits),
@@ -488,8 +488,13 @@ def validate_meta(meta) -> list:
         need(order[-1] == "lm_head", "lm_head must run last")
     covered = set()
     for name, comp in components.items():
-        need(bool(comp.get("file")), f"component {name} needs a file")
+        comp_files = comp.get("files") or {}
+        need(isinstance(comp_files, dict) and bool(comp_files),
+             f"component {name} needs a files mapping")
         funcs = comp.get("functions") or []
+        for function in funcs:
+            need(bool(comp_files.get(function)),
+                 f"component {name} needs a file for its {function} function")
         need("infer" in funcs, f"component {name} must provide the infer function")
         if batch and batch > 1:
             need("prefill" in funcs, f"component {name} must provide the prefill function")
@@ -722,10 +727,14 @@ class DoryConverter(BaseConverter):
                 return spec
         raise KeyError(f"no component named {name}; known: {[s.name for s in self.specs]}")
 
-    def file_name(self, spec: ComponentSpec) -> str:
+    def file_name(self, spec: ComponentSpec, function: str = None) -> str:
+        """Package name. One package per function: multifunction files are
+        rejected by this macOS build (see docs/dory.md), so infer and prefill
+        are separate files that each hold one function."""
         lut = _lut_value(self.lut_bits.get(spec.lut_role))
         suffix = f"_lut{lut}" if lut else ""
-        return f"{self.prefix}_{spec.name}{suffix}.mlpackage"
+        tail = f"_{function}" if function else ""
+        return f"{self.prefix}_{spec.name}{suffix}{tail}.mlpackage"
 
     def estimates(self) -> list:
         """(component, estimated bytes) for the whole conversion."""
@@ -886,58 +895,77 @@ class DoryConverter(BaseConverter):
             return palettize_weights(model, config)
 
     # -- one component end to end -----------------------------------------
-    def convert_component(self, name: str) -> Path:
-        """Convert, size-check, save and (unless disabled) placement-gate one component."""
+    def convert_component(self, name: str) -> dict:
+        """Convert one component: one package per function, sized and placement-gated."""
         spec = self.spec(name)
         bits = self.lut_bits.get(spec.lut_role)
         check_size(spec.name, estimate_component_bytes(spec, self.config, bits))
-        out_path = self.output_dir / self.file_name(spec)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         started = time.time()
         model, wrapper = self.build_component(spec)
-        temp_paths = []
+        emitted = {}
         try:
-            saved = self._emit_functions(spec, wrapper, bits, temp_paths)
-            self._combine(spec, saved, out_path)
-            size = self._dir_size(out_path)
-            check_size(spec.name, size)
-            self.sizes[spec.name] = size
+            for function, seq in self._functions(spec):
+                converted = self.convert_function(spec, wrapper, seq)
+                converted = self.palettize(converted, bits, f"{spec.name}/{function}")
+                out_path = self.output_dir / self.file_name(spec, function)
+                self._finalize_package(spec, function, converted, out_path)
+                size = self._dir_size(out_path)
+                check_size(f"{spec.name}/{function}", size)
+                emitted[function] = out_path
+                self.sizes[f"{spec.name}:{function}"] = size
+                if self.verbose:
+                    print(f"  {spec.name}/{function}: {out_path.name} "
+                          f"{size / 1024 ** 2:.0f} MB")
         finally:
-            for temp in temp_paths:
-                shutil.rmtree(temp, ignore_errors=True)
             del wrapper
             del model
-        self._gate_placement(spec, out_path)
+        for function, out_path in emitted.items():
+            self._gate_placement(spec, out_path, function)
         self.seconds[spec.name] = time.time() - started
         if self.verbose:
-            print(f"{spec.name}: {out_path.name} {self.sizes[spec.name] / 1024 ** 2:.0f} MB "
-                  f"in {self.seconds[spec.name]:.0f}s")
-        return out_path
+            total = sum(self.sizes[f"{spec.name}:{fn}"] for fn in emitted) / 1024 ** 2
+            print(f"{spec.name}: {len(emitted)} packages, {total:.0f} MB total, "
+                  f"{self.seconds[spec.name]:.0f}s")
+        return emitted
 
-    def _emit_functions(self, spec: ComponentSpec, wrapper, bits, temp_paths) -> list:
-        """Trace, convert, quantize and save each function to a temporary package."""
-        saved = []
-        for function, seq in self._functions(spec):
-            converted = self.convert_function(spec, wrapper, seq)
-            converted = self.palettize(converted, bits, f"{spec.name}/{function}")
-            temp = self.output_dir / f".tmp_{self.prefix}_{spec.name}_{function}.mlpackage"
-            shutil.rmtree(temp, ignore_errors=True)
-            converted.save(str(temp))
-            saved.append((function, temp))
-            temp_paths.append(temp)
-            if self.verbose:
-                print(f"  {spec.name}/{function}: {self._dir_size(temp) / 1024 ** 2:.0f} MB")
-        return saved
+    def _package_metadata(self, spec: ComponentSpec, function: str) -> dict:
+        """The com.anemll.* metadata recorded inside one package."""
+        return {
+            "context_length": self.config.context_length,
+            "state_length": self.config.state_length,
+            "batch_size": self.config.batch_size,
+            "num_chunks": len(self.specs),
+            "lut_bits": _lut_value(self.lut_bits.get(spec.lut_role)),
+            "function_names": [function],
+            "vocab_size": self.config.vocab_size if spec.kind == "lm_head" else None,
+            "lm_head_chunk_sizes": (self.lm_head_chunk_sizes
+                                    if spec.kind == "lm_head" else None),
+            "argmax_in_model": bool(self.argmax) if spec.kind == "lm_head" else False,
+        }
 
-    def _gate_placement(self, spec: ComponentSpec, out_path: Path) -> None:
-        """The spec's placement gate: refuse a component that is not all on the ANE."""
+    def _finalize_package(self, spec: ComponentSpec, function: str, model,
+                          out_path: Path) -> None:
+        """Attach metadata to the in-memory model and save it.
+
+        No reload: the model that just came out of ct.convert + palettize is the
+        one to write, so the save never depends on a package being loadable.
+        """
+        AddMetadata(model, self._package_metadata(spec, function))
+        shutil.rmtree(out_path, ignore_errors=True)
+        model.save(str(out_path))
+
+    def _gate_placement(self, spec: ComponentSpec, out_path: Path,
+                        function: str = None) -> None:
+        """The spec's placement gate: refuse a package that is not all on the ANE."""
+        label = f"{spec.name}/{function}" if function else spec.name
         if not self.check_placement_gate:
-            print(f"WARNING: placement gate skipped for {spec.name}; the spec "
+            print(f"WARNING: placement gate skipped for {label}; the spec "
                   f"requires every op on the Neural Engine", file=sys.stderr)
             return
         report = placement_report(out_path)
-        self.placement[spec.name] = report
-        assert_ane_only(report, f"{spec.name} ({out_path.name})")
+        self.placement.setdefault(spec.name, {})[function or "main"] = report
+        assert_ane_only(report, f"{label} ({out_path.name})")
 
     def _functions(self, spec: ComponentSpec) -> list:
         """(function_name, sequence_length) pairs this component provides."""
@@ -946,10 +974,8 @@ class DoryConverter(BaseConverter):
             pairs.append(("prefill", int(self.config.batch_size)))
         return pairs
 
-    def _combine(self, spec: ComponentSpec, saved: list, out_path: Path) -> None:
-        """Weld the functions into one multifunction package, weights deduped."""
-        from anemll.utils.dedup_weights import prepare_dedup_sources
-
+    def _unused_combine(self, spec: ComponentSpec, saved: list, out_path: Path) -> None:
+        """Retired: multifunction packages do not load on this OS (docs/dory.md)."""
         sources = [(str(path), "main", function) for function, path in saved]
         metadata = {
             "context_length": self.config.context_length,
@@ -963,20 +989,28 @@ class DoryConverter(BaseConverter):
                                     if spec.kind == "lm_head" else None),
             "argmax_in_model": bool(self.argmax) if spec.kind == "lm_head" else False,
         }
-        descriptor = None
+        # Weld into a temp package, then load THAT and save to the real name.
+        # coremltools 8.3's save_multifunction() returns None (it only writes
+        # the package), and MLModel.save() deletes its destination before
+        # copying, so saving a package onto itself would delete the source.
+        temp_package = out_path.parent / (".combine_" + out_path.name)
+        shutil.rmtree(temp_package, ignore_errors=True)
+        shutil.rmtree(out_path, ignore_errors=True)
         if len(sources) > 1:
             with prepare_dedup_sources(sources) as deduped:
                 descriptor = ct.utils.MultiFunctionDescriptor()
                 for path, src, tgt in deduped:
                     descriptor.add_function(path, src, tgt)
                 descriptor.default_function_name = sources[0][2]
-                combined = ct.utils.save_multifunction(descriptor, str(out_path))
+                ct.utils.save_multifunction(descriptor, str(temp_package))
         else:
-            shutil.rmtree(out_path, ignore_errors=True)
-            shutil.copytree(sources[0][0], out_path)
-            combined = ct.models.MLModel(str(out_path))
+            shutil.copytree(sources[0][0], temp_package)
+        combined = ct.models.MLModel(str(temp_package))
+        if combined is None:
+            raise RuntimeError(f"could not load the combined package {temp_package}")
         AddMetadata(combined, metadata)
         combined.save(str(out_path))
+        shutil.rmtree(temp_package, ignore_errors=True)
 
     @staticmethod
     def _dir_size(path: Path) -> int:
@@ -986,28 +1020,31 @@ class DoryConverter(BaseConverter):
         return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
     # -- deliverables ------------------------------------------------------
-    def compiled_name(self, spec: ComponentSpec) -> str:
-        return self.file_name(spec)[: -len(".mlpackage")] + ".mlmodelc"
+    def compiled_name(self, spec: ComponentSpec, function: str = None) -> str:
+        return self.file_name(spec, function)[: -len(".mlpackage")] + ".mlmodelc"
 
     def compile_packages(self) -> dict:
         """Compile every package to .mlmodelc (the cached form the runtime loads)."""
         done = {}
         for spec in self.specs:
-            package = self.output_dir / self.file_name(spec)
-            if not package.exists():
-                continue
-            started = time.time()
-            result = subprocess.run(
-                ["xcrun", "coremlcompiler", "compile", str(package), str(self.output_dir)],
-                capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(f"coremlcompiler failed for {package.name}: "
-                                   f"{result.stderr.strip()[:400]}")
-            done[spec.name] = {"seconds": time.time() - started,
-                               "path": str(self.output_dir / self.compiled_name(spec))}
-            if self.verbose:
-                print(f"compiled {self.compiled_name(spec)} "
-                      f"in {done[spec.name]['seconds']:.1f}s")
+            for function, _ in self._functions(spec):
+                package = self.output_dir / self.file_name(spec, function)
+                if not package.exists():
+                    continue
+                started = time.time()
+                result = subprocess.run(
+                    ["xcrun", "coremlcompiler", "compile", str(package),
+                     str(self.output_dir)],
+                    capture_output=True, text=True)
+                key = f"{spec.name}:{function}"
+                if result.returncode != 0:
+                    raise RuntimeError(f"coremlcompiler failed for {package.name}: "
+                                       f"{result.stderr.strip()[:400]}")
+                done[key] = {"seconds": time.time() - started,
+                             "path": str(self.output_dir / self.compiled_name(spec, function))}
+                if self.verbose:
+                    print(f"compiled {self.compiled_name(spec, function)} "
+                          f"in {done[key]['seconds']:.1f}s")
         return done
 
     TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
@@ -1053,12 +1090,20 @@ class DoryConverter(BaseConverter):
         return copied
 
     def manifest_files(self) -> dict:
-        """Component -> the file the runtime should load (compiled when it exists)."""
+        """Component -> {function: the file the runtime should load}.
+
+        The compiled form is preferred when it exists (it is the cached compile
+        the runtime benefits from); otherwise the package, which Core ML
+        compiles on first load.
+        """
         files = {}
         for spec in self.specs:
-            compiled = self.output_dir / self.compiled_name(spec)
-            files[spec.name] = self.compiled_name(spec) if compiled.exists() \
-                else self.file_name(spec)
+            entry = {}
+            for function, _ in self._functions(spec):
+                compiled = self.output_dir / self.compiled_name(spec, function)
+                entry[function] = (self.compiled_name(spec, function) if compiled.exists()
+                                   else self.file_name(spec, function))
+            files[spec.name] = entry
         return files
 
     def write_artifacts(self) -> dict:
@@ -1082,10 +1127,10 @@ class DoryConverter(BaseConverter):
     def write_report(self, meta: dict, tokenizer_files: list) -> Path:
         """conversion_report.json: sizes, timings and per-function placement."""
         report = {
-            "components": {name: {"bytes": self.sizes.get(name),
-                                  "seconds": self.seconds.get(name),
-                                  "placement": self.placement.get(name)}
-                           for name in meta["run_order"]},
+            "components": {name: {
+                "bytes": {fn: self.sizes.get(f"{name}:{fn}") for fn in meta["components"][name]["files"]},
+                "seconds": self.seconds.get(name),
+                "placement": self.placement.get(name)} for name in meta["run_order"]},
             "estimates": {spec.name: estimate_component_bytes(
                 spec, self.config, self.lut_bits.get(spec.lut_role))
                 for spec in self.specs},

@@ -26,8 +26,15 @@ def specs(config):
     return dcv.component_specs(config)
 
 
+def _files(specs):
+    """One package per function: the converter never welds functions together."""
+    return {spec.name: {function: f"{spec.name}_{function}.mlpackage"
+                        for function in ("infer", "prefill")}
+            for spec in specs}
+
+
 def _meta(config, specs, **overrides):
-    files = {spec.name: spec.name + ".mlpackage" for spec in specs}
+    files = _files(specs)
     kwargs = dict(config=config, specs=specs, files=files,
                   lut_bits={"embeddings": None, "blocks": 6, "lm_head": 6},
                   lm_head_chunk_sizes=[16384] * 8)
@@ -271,15 +278,27 @@ def test_read_meta_rejects_an_invalid_file(tmp_path):
 
 # -- naming ----------------------------------------------------------------
 
-def test_file_names_carry_the_lut_width(config):
+def test_file_names_carry_the_lut_width_and_the_function(config):
     converter = dcv.DoryConverter(model_path="/tmp/weights", output_dir="/tmp/out",
                                   config=config, lut_blocks=6, lut_lm_head=6,
                                   lut_embeddings=None, check_placement=False,
                                   verbose=False)
-    names = {spec.name: converter.file_name(spec) for spec in converter.specs}
-    assert names["input"] == "dory_input_lut6.mlpackage"
-    assert names["embeddings"] == "dory_embeddings.mlpackage"
-    assert names["lm_head"] == "dory_lm_head_lut6.mlpackage"
+    names = {spec.name: converter.file_name(spec, "infer") for spec in converter.specs}
+    assert names["input"] == "dory_input_lut6_infer.mlpackage"
+    assert names["embeddings"] == "dory_embeddings_infer.mlpackage"
+    assert names["lm_head"] == "dory_lm_head_lut6_infer.mlpackage"
+    assert converter.file_name(converter.spec("input"), "prefill") == \
+        "dory_input_lut6_prefill.mlpackage"
+    assert converter.compiled_name(converter.spec("input"), "prefill") == \
+        "dory_input_lut6_prefill.mlmodelc"
+
+
+def test_every_component_declares_one_file_per_function(config):
+    converter = dcv.DoryConverter(model_path="/tmp/weights", output_dir="/tmp/out",
+                                  config=config, check_placement=False, verbose=False)
+    files = converter.manifest_files()
+    for spec in converter.specs:
+        assert set(files[spec.name]) == {"infer", "prefill"}
 
 
 def test_functions_are_infer_and_prefill(config):
