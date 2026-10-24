@@ -49,26 +49,61 @@ from anemll.models.dory_ane_model import (
 
 __all__ = [
     "STATE_ATTRS",
+    "state_attrs",
     "state_names",
+    "block_input_names",
     "BlockChunk",
+    "TiledBlockChunk",
     "EmbeddingChunk",
     "LMHeadChunk",
     "empty_state_carrier",
     "lm_head_split_sizes",
 ]
 
-#: The two state buffers every component declares, in this order.
+#: The two state buffers of an untiled model, in declaration order.
 STATE_ATTRS = ("kv_cache_full", "kv_cache_sliding")
 
 
-def state_names(prefix: str = "model") -> tuple:
-    """Qualified names of the two states, as Core ML sees them.
+def state_attrs(config=None) -> tuple:
+    """Every state buffer a component declares, in declaration order.
+
+    The tiled full-attention fallback (spec D7) turns the one full cache into
+    one buffer per tile, so the union of states is derived from the config
+    rather than hard-coded -- the converter, the runtime's single MLState and
+    every component must agree on the list or Core ML refuses the shared state.
+    """
+    tiles = getattr(config, "full_tiles", (1,)) if config is not None else (1,)
+    if len(tiles) == 1:
+        full = ["kv_cache_full"]
+    else:
+        full = [f"kv_cache_full_{index}" for index in range(1, len(tiles) + 1)]
+    return tuple(full + ["kv_cache_sliding"])
+
+
+def state_names(config=None, prefix: str = "model") -> tuple:
+    """Qualified names of the states, as Core ML sees them.
 
     coremltools 8.3 renames dots inside a state name (model.kv_cache_full ->
     model_kv_cache_full) but consistently, so the union works as long as every
     component is built by this module.
     """
-    return tuple(f"{prefix}.{attr}" for attr in STATE_ATTRS)
+    return tuple(f"{prefix}.{attr}" for attr in state_attrs(config))
+
+
+def block_input_names(tiled: bool, loop_entry: bool) -> list:
+    """The traced input names of a block component, in signature order.
+
+    The converter, the traced wrapper and the runtime's call must agree on this
+    order exactly: Core ML maps the declared inputs positionally onto the traced
+    graph.  A tiled full cache needs the per-tile write index and gate, because
+    a traced graph cannot branch on the position (see BlockChunk).
+    """
+    names = ["hidden_states", "causal_mask", "current_pos", "cache_pos"]
+    if tiled:
+        names += ["write_index_1", "write_gate_1", "write_index_2", "write_gate_2"]
+    if loop_entry:
+        names.append("h_in")
+    return names
 
 
 class _StateTouching(nn.Module):
@@ -83,10 +118,10 @@ class _StateTouching(nn.Module):
     model: DoryANEModel
 
     def touch_states(self, out: torch.Tensor) -> torch.Tensor:
-        """Add 0 * both caches, so neither is pruned as unused."""
-        carrier = self.model
-        dummy = carrier.kv_cache_full[0, 0, 0, 0] * 0.0
-        dummy = dummy + carrier.kv_cache_sliding[0, 0, 0, 0] * 0.0
+        """Add 0 * every cache, so none is pruned as unused."""
+        dummy = self.model.kv_cache_sliding[0, 0, 0, 0] * 0.0
+        for cache in self.model.full_caches:
+            dummy = dummy + cache[0, 0, 0, 0] * 0.0
         return out + dummy.view(1, 1, 1)
 
 
@@ -119,14 +154,29 @@ class BlockChunk(_StateTouching):
         self.loop_entry = bool(loop_entry)
         self.loop_exit = bool(loop_exit)
 
-    def forward(self, hidden_states, causal_mask, current_pos, cache_pos, h_in=None):
-        if self.loop_entry:
-            if h_in is None:
-                raise ValueError("the recurrent chunk needs h_in (the loop entry state)")
-            out = self.chunk(hidden_states, causal_mask, current_pos, cache_pos, h_in)
-        else:
-            out = self.chunk(hidden_states, causal_mask, current_pos, cache_pos)
+    def run(self, hidden_states, causal_mask, current_pos, cache_pos, h_in=None,
+            write_index_1=None, write_gate_1=None, write_index_2=None, write_gate_2=None):
+        out = self.chunk(hidden_states, causal_mask, current_pos, cache_pos, h_in,
+                         write_index_1, write_gate_1, write_index_2, write_gate_2)
         return self.touch_states(out)
+
+    def forward(self, hidden_states, causal_mask, current_pos, cache_pos, h_in=None):
+        return self.run(hidden_states, causal_mask, current_pos, cache_pos, h_in)
+
+
+class TiledBlockChunk(BlockChunk):
+    """The same chunk, traced with the per-tile write index and gate.
+
+    A separate class rather than an optional argument: the traced signature has
+    to place every tensor input first (torch.jit.trace cannot be handed a None
+    placeholder), while the eager callers keep h_in as the fifth positional
+    argument.  block_input_names() is the single source of truth for the order.
+    """
+
+    def forward(self, hidden_states, causal_mask, current_pos, cache_pos,
+                write_index_1, write_gate_1, write_index_2, write_gate_2, h_in=None):
+        return self.run(hidden_states, causal_mask, current_pos, cache_pos, h_in,
+                        write_index_1, write_gate_1, write_index_2, write_gate_2)
 
 
 class EmbeddingChunk(_StateTouching):

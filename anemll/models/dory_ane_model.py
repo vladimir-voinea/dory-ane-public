@@ -49,6 +49,13 @@ __all__ = [
 MODEL_DTYPE = torch.float16
 
 
+def _as_list(value):
+    """One cache or mask, or the list a tiled attention passes."""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -80,6 +87,13 @@ class DoryANEConfig:
         self.gate_init = g("gate_init", 50.59644317626953)
         self.l2_eps = g("l2_eps", 1e-6)
         self.context_length = g("context_length", 512)
+
+        # Spec D7: one full-attention cache of context_length rows, or the
+        # fallback's two tiles (16,384 + 8,192 at 24,576 tokens).  None keeps one
+        # untiled cache; the two-tile layout is what a 24,576-row state falls
+        # back to when it does not stay on the ANE.
+        self.full_cache_tiles = g("full_cache_tiles", None)
+
         self.state_length = g("state_length", self.context_length)
         self.batch_size = g("batch_size", 64)
         self.fold_scales = g("fold_scales", True)
@@ -106,7 +120,22 @@ class DoryANEConfig:
         return dc.full_cache_rows(self.context_length)
 
     @property
+    def full_tiles(self) -> tuple:
+        """Row counts of the full-attention caches: (context,) or the two tiles."""
+        return dc.full_cache_tiles(self.context_length, self.full_cache_tiles)
+
+    @property
+    def tiled(self) -> bool:
+        return len(self.full_tiles) > 1
+
+    @property
+    def full_tile_offsets(self) -> tuple:
+        return dc.full_tile_offsets(self.full_tiles)
+
+    @property
     def sliding_rows(self) -> int:
+        return dc.sliding_cache_rows(self.context_length, self.sliding_window, self.batch_size)
+
         return dc.sliding_cache_rows(self.context_length, self.sliding_window, self.batch_size)
 
     @property
@@ -276,6 +305,9 @@ class DoryANEAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(float(self.head_dim))
         self.slot = 0
         self.num_slots = 1
+        # the full-attention tile layout, as plain ints for the eager write
+        self.tile_offsets = config.full_tile_offsets
+        self.tile_rows = config.full_tiles
 
         accum = config.compute_mode
         self.q_proj = _conv1x1(config.hidden_size, self.num_heads * self.head_dim, dt, accum)
@@ -307,9 +339,27 @@ class DoryANEAttention(nn.Module):
         kg = math.sqrt(float(config.gate_init)) / float(config.init_std)
         return ((s_gate.detach().to(torch.float32) * kg) ** 2)
 
-    def forward(self, hidden_states, mask, cache, slot, num_slots, current_pos, cache_pos):
+    def tile_geometry(self):
+        """(offset, rows) per full-attention tile, as plain Python ints."""
+        return tuple(zip(self.tile_offsets, self.tile_rows))
+
+    def forward(self, hidden_states, masks, caches, slot, num_slots, current_pos, cache_pos,
+                write_indices=None, write_gates=None):
+        """Attention over one cache, or over the spec's two full-attention tiles.
+
+        masks / caches are lists: one entry per full-attention tile for a full
+        layer (two of them when the tiled fallback is selected), a single entry
+        for a sliding layer.  The sliding cache is a ring written at cache_pos; a
+        full cache is addressed by absolute position, and with tiles each tile is
+        written at its own host-computed write_index / write_gate, because a
+        traced graph cannot branch on the position.
+        """
         bsz, q_len, _ = hidden_states.shape
         h, kv, d, rep = self.num_heads, self.num_kv_heads, self.head_dim, self.rep
+        masks = _as_list(masks)
+        caches = _as_list(caches)
+        if len(masks) != len(caches):
+            raise ValueError(f"{len(masks)} masks for {len(caches)} caches")
 
         conv_in = _to_conv_layout(hidden_states)
         q = _from_conv_layout(self.q_proj(conv_in))
@@ -330,27 +380,78 @@ class DoryANEAttention(nn.Module):
         q = self.q_norm(q) * self.sq.view(1, h, 1, d)               # L2 then sqk
         k = self.k_norm(k)
 
-        # -- write the current rows, then read the whole (static-width) slot.
+        # -- write the current rows, then read the tiles back.
         # A full cache is addressed by absolute position; only a sliding cache
         # uses the ring offset.  (They coincide until context_length exceeds
         # sliding_rows, which is why a short-context test cannot see this.)
-        write_start = current_pos if self.is_full else cache_pos
-        dc.write_cache_rows(cache, slot, k, v, write_start, num_slots)
-        key_cache, value_cache = dc.read_cache_slot(cache, slot, num_slots, mask.shape[-1])
+        if self.is_full:
+            self._write_full(caches, slot, num_slots, k, v, current_pos, q_len,
+                             write_indices, write_gates)
+        else:
+            dc.write_cache_rows(caches[0], slot, k, v, cache_pos, num_slots)
 
         # -- grouped-query attention by reshaping the queries per KV head
-        q = q.view(bsz, kv, rep, q_len, d).reshape(bsz, kv, rep * q_len, d)
-        logits = torch.matmul(q, key_cache.transpose(-1, -2)) * self.scale
-        logits = logits.view(bsz, kv, rep, q_len, -1).reshape(bsz, h, q_len, -1)
-        logits = logits + mask
-        probs = torch.softmax(logits, dim=-1)
-        probs = probs.view(bsz, kv, rep, q_len, -1).reshape(bsz, kv, rep * q_len, -1)
-        out = torch.matmul(probs, value_cache)                      # (B, KV, rep*Q, D)
-        out = out.view(bsz, kv, rep, q_len, d).reshape(bsz, h, q_len, d)
+        q_g = q.view(bsz, kv, rep, q_len, d).reshape(bsz, kv, rep * q_len, d)
+        if len(caches) == 1:
+            # The shipped single-cache path: exactly DANE-4's arithmetic, so the
+            # numbers the earlier tickets measured stay bit for bit what they were.
+            key_cache, value_cache = dc.read_cache_slot(caches[0], slot, num_slots,
+                                                        masks[0].shape[-1])
+            logits = torch.matmul(q_g, key_cache.transpose(-1, -2)) * self.scale
+            logits = logits.view(bsz, kv, rep, q_len, -1).reshape(bsz, h, q_len, -1)
+            logits = logits + masks[0]
+            probs = torch.softmax(logits, dim=-1)
+            probs = probs.view(bsz, kv, rep, q_len, -1).reshape(bsz, kv, rep * q_len, -1)
+            out4 = torch.matmul(probs, value_cache)                 # (B, KV, rep*Q, D)
+        else:
+            # The tiled fallback (spec D7): one partial per tile, combined with a
+            # log-sum-exp merge over the two disjoint key sets.
+            partials = []
+            for cache, mask in zip(caches, masks):
+                key_cache, value_cache = dc.read_cache_slot(cache, slot, num_slots,
+                                                            mask.shape[-1])
+                logits = torch.matmul(q_g, key_cache.transpose(-1, -2)) * self.scale
+                logits = logits.view(bsz, kv, rep, q_len, -1).reshape(bsz, h, q_len, -1)
+                logits = logits + mask
+                partials.append((logits.view(bsz, kv, rep * q_len, -1), value_cache))
+            out4, _ = dc.merge_attention_partials(partials)
+
+        out = out4.view(bsz, kv, rep, q_len, d).reshape(bsz, h, q_len, d)
         out = out.transpose(1, 2).reshape(bsz, q_len, h * d)
 
         out = self.out_norm(out * gate)                             # gate, then L2 over 4096
         return _from_conv_layout(self.o_proj(_to_conv_layout(out)))
+
+    def _write_full(self, caches, slot, num_slots, k, v, current_pos, q_len,
+                    write_indices, write_gates):
+        """Write the current rows into the full cache -- one cache or two tiles.
+
+        Traced (write_indices / write_gates given): every tile gets one lerp write
+        at its own host-computed index, gated to the tile that owns the position;
+        a gated-off tile rewrites its own rows unchanged, which is exact in FP16.
+        Eager (no indices): the rows each tile owns are written directly, so a
+        batch that straddles the tile boundary is exact there too.
+        """
+        if write_indices is None:
+            if len(caches) == 1:
+                dc.write_cache_rows(caches[0], slot, k, v, current_pos, num_slots)
+                return
+            start = int(current_pos)
+            for (offset, rows), cache in zip(self.tile_geometry(), caches):
+                lo, hi = max(start, offset), min(start + q_len, offset + rows)
+                if hi <= lo:
+                    continue
+                dc.write_cache_rows(cache, slot,
+                                    k[:, :, lo - start:hi - start, :],
+                                    v[:, :, lo - start:hi - start, :],
+                                    lo - offset, num_slots)
+            return
+        for index, gate, cache in zip(write_indices, write_gates, caches):
+            gate = gate.to(cache.dtype)
+            for row, new in ((slot, k), (slot + num_slots, v)):
+                current = cache[row:row + 1, :, index:index + q_len, :]
+                updated = current + (new.to(cache.dtype) - current) * gate
+                cache[row:row + 1, :, index:index + q_len, :] = updated
 
 
 class DoryANEMLP(nn.Module):
@@ -411,15 +512,17 @@ class DoryANEDecoderLayer(nn.Module):
         return (residual_alpha.detach().to(torch.float32) * ka).abs()
 
     def forward(self, hidden_states, mask_full, mask_sliding, cache_full, cache_sliding,
-                current_pos, cache_pos):
+                current_pos, cache_pos, write_indices=None, write_gates=None):
         residual = hidden_states
         if self.is_mlp:
             block_out = self.mixer(hidden_states)
+        elif self.is_full:
+            block_out = self.mixer(hidden_states, _as_list(mask_full), _as_list(cache_full),
+                                   self.slot, self.num_slots, current_pos, cache_pos,
+                                   write_indices, write_gates)
         else:
-            cache = cache_full if self.is_full else cache_sliding
-            mask = mask_full if self.is_full else mask_sliding
-            block_out = self.mixer(hidden_states, mask, cache, self.slot,
-                                   self.num_slots, current_pos, cache_pos)
+            block_out = self.mixer(hidden_states, [mask_sliding], [cache_sliding],
+                                   self.slot, self.num_slots, current_pos, cache_pos)
         alpha = self.alpha.to(hidden_states.dtype).view(1, 1, -1)
         a = self.norm_in(residual)
         b = self.norm_out(block_out)
@@ -457,29 +560,54 @@ class DoryANEModel(nn.Module):
                 layer.slot = sliding_slots[layer.block]
                 layer.num_slots = len(sliding_slots)
 
-        full_shape, sliding_shape = dc.cache_shapes(
+        tiles = config.full_tiles
+        self._full_cache_names = []
+        for index, shape in enumerate(dc.full_cache_shapes(
+                config.context_length, config.num_key_value_heads, config.head_dim,
+                tiles, num_slots=len(full_slots)), start=1):
+            name = "kv_cache_full" if len(tiles) == 1 else f"kv_cache_full_{index}"
+            self.register_buffer(name, torch.zeros(shape, dtype=config.dtype),
+                                 persistent=False)
+            self._full_cache_names.append(name)
+        _, sliding_shape = dc.cache_shapes(
             config.context_length, config.num_key_value_heads, config.head_dim,
             config.sliding_window, config.batch_size)
-        self.register_buffer("kv_cache_full", torch.zeros(full_shape, dtype=config.dtype),
-                             persistent=False)
         self.register_buffer("kv_cache_sliding", torch.zeros(sliding_shape, dtype=config.dtype),
                              persistent=False)
         self.l2 = DoryL2Norm(config.hidden_size, config.l2_eps)
 
+    @property
+    def full_caches(self) -> list:
+        """The full-attention cache buffers: one, or the spec's two tiles."""
+        return [getattr(self, name) for name in self._full_cache_names]
+
     def reset_caches(self) -> None:
-        dc.reset_caches(self.kv_cache_full, self.kv_cache_sliding)
+        dc.reset_caches(*self.full_caches, self.kv_cache_sliding)
 
     def cache_bytes(self) -> int:
-        return (self.kv_cache_full.numel() * self.kv_cache_full.element_size()
-                + self.kv_cache_sliding.numel() * self.kv_cache_sliding.element_size())
+        buffers = self.full_caches + [self.kv_cache_sliding]
+        return sum(b.numel() * b.element_size() for b in buffers)
+
+    def split_mask(self, causal_mask):
+        """The whole-context mask as (one slice per full tile, the sliding mask).
+
+        The mask input stays a single concatenated tensor of width
+        context_length + sliding_rows (the runtime builds it once per call); the
+        tiles take their own static column slices of the full part, so a tiled
+        attention never sees the whole 24,576 columns at once.
+        """
+        ctx = self.config.context_length
+        full = causal_mask.narrow(-1, 0, ctx)
+        masks = [full.narrow(-1, offset, rows)
+                 for offset, rows in zip(self.config.full_tile_offsets, self.config.full_tiles)]
+        return masks, causal_mask.narrow(-1, ctx, self.config.sliding_rows)
 
     def process_blocks(self, hidden_states, causal_mask, current_pos, cache_pos):
-        ctx = self.config.context_length
-        mask_full = causal_mask.narrow(-1, 0, ctx)
-        mask_sliding = causal_mask.narrow(-1, ctx, self.config.sliding_rows)
+        masks_full, mask_sliding = self.split_mask(causal_mask)
+        caches = self.full_caches
         h = hidden_states
         for layer in self.layers:
-            h = layer(h, mask_full, mask_sliding, self.kv_cache_full, self.kv_cache_sliding,
+            h = layer(h, masks_full, mask_sliding, caches, self.kv_cache_sliding,
                       current_pos, cache_pos)
         return h
 
@@ -506,17 +634,35 @@ class DoryANEChunk(nn.Module):
         if len(self._indices) != self.end_block - self.start_block:
             raise ValueError(f"chunk {start_block}:{end_block} misses blocks in this model")
 
-    def forward(self, hidden_states, causal_mask, current_pos, cache_pos, h_in=None):
+    def forward(self, hidden_states, causal_mask, current_pos, cache_pos, h_in=None,
+                write_index_1=None, write_gate_1=None,
+                write_index_2=None, write_gate_2=None):
+        """One block range.  The extra inputs exist only for a tiled full cache.
+
+        A traced graph cannot branch on the position, so a tiled conversion
+        passes one write index and one write gate per tile (the host knows which
+        tile owns the position); an untiled conversion and the eager path pass
+        neither and the model writes by absolute position itself.
+        """
         model = self.model
-        ctx = model.config.context_length
-        mask_full = causal_mask.narrow(-1, 0, ctx)
-        mask_sliding = causal_mask.narrow(-1, ctx, model.config.sliding_rows)
+        masks_full, mask_sliding = model.split_mask(causal_mask)
+        caches = model.full_caches
+        write_indices = None
+        write_gates = None
+        if write_index_1 is not None:
+            write_indices = [write_index_1]
+            write_gates = [write_gate_1]
+            if write_index_2 is not None:
+                write_indices.append(write_index_2)
+                write_gates.append(write_gate_2)
         h = hidden_states
         if self.loop_entry:
+            if h_in is None:
+                raise ValueError("the recurrent chunk needs h_in (the loop entry state)")
             h = model.l2(h + h_in)
         for i in self._indices:
-            h = model.layers[i](h, mask_full, mask_sliding, model.kv_cache_full,
-                                model.kv_cache_sliding, current_pos, cache_pos)
+            h = model.layers[i](h, masks_full, mask_sliding, caches, model.kv_cache_sliding,
+                                current_pos, cache_pos, write_indices, write_gates)
         if self.loop_exit:
             h = model.l2(h)
         return h
@@ -591,6 +737,42 @@ class DoryANEForCausalLM(nn.Module):
                                     self.config.sliding_rows, self.config.sliding_window,
                                     dtype=self.config.dtype).to(self.device)
 
+    def tile_write_inputs(self, start: int, q_len: int) -> dict:
+        """Per-tile (write_index, write_gate) for the traced tiled path.
+
+        The host owns the decision a traced graph cannot make: which tile the
+        batch's rows belong to.  Each tile gets the index its rows start at
+        (clamped, so a gated-off tile writes in range) and a 0/1 gate; the model
+        lerps, so a gated-off tile is rewritten unchanged.  Tiles are 64-aligned
+        and prefill batches are multiples of the batch size, so a batch only
+        straddles a tile boundary in eager use, where the model splits the write
+        itself.
+        """
+        if not self.config.tiled:
+            return {}
+        start, q_len = int(start), int(q_len)
+        end = start + q_len
+        owners = [(offset, rows) for offset, rows in zip(self.config.full_tile_offsets,
+                                                        self.config.full_tiles)
+                  if start >= offset and end <= offset + rows]
+        if not owners:
+            raise ValueError(
+                f"a {q_len}-token batch at {start} straddles the full-attention tile "
+                f"boundary {self.config.full_tiles}: a traced tiled graph writes one "
+                f"tile per call, so batches must sit inside a tile (64-aligned prefill "
+                f"batches do; a short tail goes through the one-token path)")
+        owner_offset, owner_rows = owners[0]
+        writes = {}
+        for tile, (offset, rows) in enumerate(zip(self.config.full_tile_offsets,
+                                                  self.config.full_tiles), start=1):
+            inside = 1.0 if (offset, rows) == (owner_offset, owner_rows) else 0.0
+            index = (start - owner_offset) if inside else 0
+            writes[f"write_index_{tile}"] = torch.tensor([index], dtype=torch.int32,
+                                                         device=self.device)
+            writes[f"write_gate_{tile}"] = torch.tensor([inside], dtype=self.config.dtype,
+                                                        device=self.device)
+        return writes
+
     # -- forward paths ----------------------------------------------------
     @torch.inference_mode()
     def prefill(self, input_ids: torch.Tensor, start_pos: int = 0, loops: Optional[int] = None):
@@ -610,12 +792,13 @@ class DoryANEForCausalLM(nn.Module):
         cur = int(start_pos)
         cache_pos = int(start_pos) % self.config.sliding_rows
         mask = self.build_mask(start_pos, q_len)
+        tile_keywords = self.tile_write_inputs(start_pos, q_len)
         h = self.embed_tokens(input_ids)
-        h = self.chunk_input(h, mask, cur, cache_pos)
+        h = self.chunk_input(h, mask, cur, cache_pos, **tile_keywords)
         h_in = h
         for _ in range(loops):
-            h = self.chunk_recurrent(h, mask, cur, cache_pos, h_in)
-        h = self.chunk_output(h, mask, cur, cache_pos)
+            h = self.chunk_recurrent(h, mask, cur, cache_pos, h_in, **tile_keywords)
+        h = self.chunk_output(h, mask, cur, cache_pos, **tile_keywords)
         return self.logits(h)
 
     @torch.inference_mode()
@@ -626,12 +809,13 @@ class DoryANEForCausalLM(nn.Module):
         cache_pos = int(pos) % self.config.sliding_rows
         mask = self.build_mask(pos, 1)
         ids = torch.tensor([[int(token_id)]], dtype=torch.long, device=self.device)
+        tile_keywords = self.tile_write_inputs(pos, 1)
         h = self.embed_tokens(ids)
-        h = self.chunk_input(h, mask, cur, cache_pos)
+        h = self.chunk_input(h, mask, cur, cache_pos, **tile_keywords)
         h_in = h
         for _ in range(loops):
-            h = self.chunk_recurrent(h, mask, cur, cache_pos, h_in)
-        h = self.chunk_output(h, mask, cur, cache_pos)
+            h = self.chunk_recurrent(h, mask, cur, cache_pos, h_in, **tile_keywords)
+        h = self.chunk_output(h, mask, cur, cache_pos, **tile_keywords)
         return self.logits(h)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
