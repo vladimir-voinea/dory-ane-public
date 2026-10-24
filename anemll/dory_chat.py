@@ -262,8 +262,15 @@ CHATML_FALLBACK = (
 )
 
 
-def render_template(template_text: str, messages, reasoning: bool = True) -> str:
-    """Render a Jinja chat template with the variables a HF template expects."""
+def render_template(template_text: str, messages, reasoning: bool = True,
+                    tools=None) -> str:
+    """Render a Jinja chat template with the variables a HF template expects.
+
+    `tools` is the OpenAI `tools` array: Dory's template renders it as
+    `<tools>/<function>/<parameter>` XML inside the system block and teaches the
+    model the `<tool_call>` reply format, so a request that carries tools has to
+    pass them through or the model never learns the tools exist.
+    """
     from jinja2 import Environment, BaseLoader
 
     environment = Environment(loader=BaseLoader(), trim_blocks=True, lstrip_blocks=True,
@@ -273,6 +280,7 @@ def render_template(template_text: str, messages, reasoning: bool = True) -> str
         messages=messages,
         add_generation_prompt=True,
         enable_thinking=bool(reasoning),
+        tools=list(tools) if tools else [],
         bos_token="<s>",
         eos_token="<|im_end|>",
     )
@@ -308,9 +316,10 @@ class ChatTokenizer:
         fallback = (self.meta.get("tokenizer") or {}).get("chat_template_fallback")
         return CHATML_FALLBACK, fallback or "chatml-think"
 
-    def apply_chat_template(self, messages, reasoning: bool = True) -> str:
+    def apply_chat_template(self, messages, reasoning: bool = True, tools=None) -> str:
         """Render the conversation with reasoning on by default."""
-        return render_template(self.template_text, messages, reasoning=reasoning)
+        return render_template(self.template_text, messages, reasoning=reasoning,
+                               tools=tools)
 
     def encode(self, text: str) -> np.ndarray:
         return np.asarray(self.tokenizer.encode(text, add_special_tokens=False),
