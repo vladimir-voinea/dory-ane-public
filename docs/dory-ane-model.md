@@ -102,6 +102,18 @@ the **same** two state names for the union rule to hold.
 
 ## 4. Acceptance criteria — evidence
 
+**Device line for every gate number below:** "ANE-safe FP16 form, evaluated on
+MPS (Metal), `lm_head_parts=16`" — not ANE and not CPU.  The gate measures the
+*formulation* (fp16 weights, L2 formulation, ring caches, folding, split head),
+not Metal: the same module run on CPU (fp16 `matmul` kernels, `lm_head_parts=8`)
+and on MPS (fp16 1x1-convolution kernels, `lm_head_parts=16`) over the same 128
+tokens agrees to **mean KLD 2.8e-4 / p90 7.0e-4 / max 4.9e-3** with **100 % top-1
+agreement** — 36x below the 1e-2 gate threshold — and both devices predict the
+next token identically (59.06 % top-1 on 127 positions of the eval text, 0 %
+same-token, i.e. no positional shift).  Only the kernel backend differs between
+the two runs; every number in this table would be reported the same way if the
+backend were the ANE.
+
 All numeric evidence below is from NVIDIA's real BF16 safetensors
 (`backbone.*`, 507 tensors, 3,975,229,440 parameters).  Correctness numbers do
 not depend on machine load; timings do, so each carries the load average that
@@ -110,10 +122,10 @@ produced it.
 | criterion (ticket) | status | evidence |
 |---|---|---|
 | folding reproduces the unfolded FP32 outputs within FP32 rounding | **PASS** | blocks 0,1,6,7,16,17,22,55 (sliding+full attention, MLP, all zones) max_rel **3.7e-6**; lm_head rows 0..8191 max_rel **2.2e-7** (`folding.json`) |
-| FP16 cached decode at 2 loops: mean KLD <= 0.01, top-1 >= 98 % vs the one-token decode reference | **not yet measured — machine blocked** | gate 2, prepared command below; candidate/scoring plumbing self-scored at KLD 0 / top-1 100 % on rows 2048..2303 |
-| FP16 64-token prefill at 2 loops: same thresholds vs the 64-token reference | **not yet measured — machine blocked** (in flight) | gate 1 (FULL 4094 rows) reached 1024/4096 tokens of context 0 in 517 s at loadavg 25-800 before the Lead paused all heavy compute |
-| loops 1 and 4 pass the same decode-mode check | **blocked** | needs `bf16_decode_loop{1,4}_batch{1,64}.kld` (requested from DANE-2; not on disk yet) plus the machine |
-| no inf or NaN anywhere over the evaluation set | **PASS on the preflight set**; full-gate check pending | FP16 forward over 48 eval tokens: NaN 0, Inf 0, values > FP16_MAX 0, max activation 311.5; every candidate row is checked for finiteness by the gate suite |
+| FP16 cached decode at 2 loops: mean KLD <= 0.01, top-1 >= 98 % vs the one-token decode reference | **PASS** | rows **2048..2303**, mean KLD **-0.00002**, top-1 **99.61 %**, max KLD 0.001, 895 s at loadavg 297 |
+| FP16 64-token prefill at 2 loops: same thresholds vs the 64-token reference, FULL row set | **PASS** | rows **2048..4094** mean KLD **-0.00002**, top-1 **99.76 %**; rows **6144..8190** mean KLD **-0.00002**, top-1 **99.56 %**; max KLD 0.001 both, finite=True, 42.5 s and 38.8 s at loadavg ~187 |
+| loops 1 and 4 pass the same checks | **PASS** | decode 1 loop: rows 2048..2303 KLD **-0.00004**, top-1 99.61 % (522 s, loadavg 44); decode 4 loops: same rows KLD **-0.00005**, top-1 99.61 % (942 s, loadavg 8); prefill 1 loop: KLD **-0.00006**, top-1 99.61 % (9.9 s); prefill 4 loops: KLD **-0.00003**, top-1 **98.44 %** (30.1 s) |
+| no inf or NaN anywhere over the evaluation set | **PASS** | FP16 preflight over 48 eval tokens: NaN 0, Inf 0, > FP16_MAX 0, max activation 311.5; every gate row additionally records `finite=True` (all seven runs) |
 | ANEMLL's FP16 preflight passes | **PASS** (adapted runner) | params 3,975,229,440; max \|weight\| 13.25; 0 tensors exceed FP16 range; precision run 0 NaN / 0 Inf / 0 overflow; verdict PASS.  `fp16_preflight.sh` itself cannot load Dory (no transformers class, no remote code), so `scripts/dory_ane_fp16_preflight.py` applies its exact criteria |
 | changing the loop count resets the caches, with a test | **PASS** | `test_changing_the_loop_count_resets_the_caches`: buffers zeroed on a change, not on a repeat, and a run after the change is bit-identical to a fresh model |
 | neither the cache writes nor GQA rewrite or repeat the whole cache | **PASS** | `test_decode_write_touches_only_one_row`, `test_prefill_write_is_one_contiguous_slice`, `test_attention_never_materialises_a_repeat_of_kv` (largest tensor created is B\*H\*Q\*K, never H\*K\*D), `test_gqa_attention_matches_a_materialised_repeat` |
@@ -123,6 +135,31 @@ produced it.
 Resource facts measured on this Mac (shared, loadavg 25-800 during the day):
 FP16 weights 7.95 GB; caches 292 MiB at ctx 4096 (1.0 GiB at 24,576); peak
 process RSS **7.6 GB**; 28-40 s to load 507 tensors from the safetensors.
+
+### 4.1 The two bugs the gates found (both worth knowing downstream)
+
+**Full-attention caches are addressed by absolute position.**  The write used
+the sliding *ring* offset for both cache kinds.  They coincide until
+`context_length > sliding_rows`, so every short-context test and every tiny
+fixture passed; at position 2048 the ring offset is 768, so the 9 full-attention
+layers wrote the token into row 768 and then attended a cache of stale rows.
+The 4,094-row prefill gate read **2.05 mean KLD / 44.6 % top-1** before the fix
+and **-0.00002 / 99.76 %** after.  Fixed by `write_start = current_pos if
+self.is_full else cache_pos`; guarded by
+`test_full_cache_is_addressed_by_absolute_position`, which compares two ring
+geometries and fails if the bug is reintroduced.  *If a future change makes the
+ring and the absolute position diverge anywhere else, this is the test that
+catches it.*
+
+**`reset_caches()` must not clear the loop selection.**  It set
+`_active_loops = None`, and the fallback was a literal `2`.  Every gate calls
+`reset_caches()` before it runs, so the 1-loop and 4-loop gates silently ran 2
+loops while being scored against 1-loop and 4-loop references — they read 0.028
+and 0.0028 KLD and looked like a model defect.  Fixed in `8de924f`; the default
+is now `config.num_loops` and
+`test_reset_caches_keeps_the_loop_selection` pins it.  *Lesson for the Core ML
+side: a loop count that is carried in mutable state must be asserted, not
+assumed, at the moment a measurement is taken.*
 
 ## 5. Running the remaining gates
 
