@@ -138,3 +138,93 @@ def test_the_tile_layout_is_parsed_and_validated():
     with pytest.raises(SystemExit):
         dcv.parse_tile_rows("abc")
 
+
+
+# -- the exported RoPE rows ------------------------------------------------
+
+def test_the_converter_exports_the_rows_the_graph_used(tmp_path):
+    config = tiled_config()
+    path = dcv.write_rope_tables(config, tmp_path)
+    assert path.name == dcv.ROPE_TABLE_FILE
+    with np.load(path) as data:
+        assert sorted(data.files) == sorted(dcv.ROPE_TABLE_KEYS)
+        for key in dcv.ROPE_TABLE_KEYS:
+            assert data[key].shape == (config.context_length + 1, config.head_dim)
+            assert data[key].dtype == np.float16
+    # one source of truth: the exported rows are the model's own table rows
+    import torch
+
+    full = dam.DoryANERotaryEmbedding(config.head_dim, config.rope_theta_full,
+                                      config.context_length + 1, torch.float16)
+    sliding = dam.DoryANERotaryEmbedding(config.head_dim, config.rope_theta_sliding,
+                                         config.context_length + 1, torch.float16)
+    with np.load(path) as data:
+        assert np.array_equal(data["cos_full"], full.cos_cached.detach().cpu().numpy())
+        assert np.array_equal(data["sin_sliding"], sliding.sin_cached.detach().cpu().numpy())
+
+
+def test_the_meta_declares_the_sidecar():
+    config = tiled_config()
+    meta, _ = meta_and_specs(config)
+    declared = meta["parameters"]["rope_tables"]
+    assert declared["file"] == dcv.ROPE_TABLE_FILE
+    assert declared["rows"] == config.context_length + 1
+    assert declared["head_dim"] == config.head_dim
+    assert declared["keys"] == list(dcv.ROPE_TABLE_KEYS)
+    assert dcv.validate_meta(meta) == []
+
+
+def test_a_meta_claiming_rope_inputs_without_a_usable_sidecar_is_refused():
+    config = tiled_config()
+    meta, _ = meta_and_specs(config)
+    meta["parameters"]["rope_tables"] = None
+    assert any("rope_tables" in problem for problem in dcv.validate_meta(meta))
+    meta["parameters"]["rope_tables"] = {
+        "file": dcv.ROPE_TABLE_FILE, "rows": config.context_length + 1,
+        "head_dim": int(config.head_dim) + 1, "keys": list(dcv.ROPE_TABLE_KEYS)}
+    assert any("head_dim" in problem for problem in dcv.validate_meta(meta))
+
+
+def _runtime_with_sidecar(tmp_path, config):
+    from anemll import dory_chat as chat
+
+    dcv.write_rope_tables(config, tmp_path)
+    runtime = chat.DoryRuntime.__new__(chat.DoryRuntime)
+    runtime.model_dir = tmp_path
+    runtime.params = {"rope_tables_as_inputs": True,
+                      "rope_tables": dcv.rope_table_descriptor(config),
+                      "context_length": int(config.context_length)}
+    runtime.meta = {"parameters": runtime.params}
+    runtime.rope_tables = runtime._load_rope_tables()
+    return runtime
+
+
+def test_the_runtime_slices_the_rows_the_converter_exported(tmp_path):
+    import torch
+
+    from anemll import dory_chat as chat
+
+    config = tiled_config()
+    runtime = _runtime_with_sidecar(tmp_path, config)
+    out = runtime._rope_inputs(list(dcv.ROPE_TABLE_KEYS), 16384, 64)
+    assert set(out) == set(dcv.ROPE_TABLE_KEYS)
+    full = dam.DoryANERotaryEmbedding(config.head_dim, config.rope_theta_full,
+                                      config.context_length + 1, torch.float16)
+    cos, sin = full.table_rows(16384, 64)
+    assert out["cos_full"].shape == (1, 1, 64, config.head_dim)
+    assert np.array_equal(out["cos_full"], cos.detach().cpu().numpy())
+    assert np.array_equal(out["sin_full"], sin.detach().cpu().numpy())
+    with pytest.raises(chat.ContextOverflowError, match="RoPE rows"):
+        runtime._rope_inputs(["cos_full"], int(config.context_length) - 8, 64)
+
+
+def test_a_package_without_the_sidecar_is_refused(tmp_path):
+    from anemll import dory_chat as chat
+
+    runtime = chat.DoryRuntime.__new__(chat.DoryRuntime)
+    runtime.model_dir = tmp_path
+    runtime.params = {"rope_tables_as_inputs": True,
+                      "rope_tables": {"file": dcv.ROPE_TABLE_FILE, "rows": 8,
+                                      "head_dim": 4, "keys": list(dcv.ROPE_TABLE_KEYS)}}
+    with pytest.raises(RuntimeError, match="missing"):
+        runtime._load_rope_tables()

@@ -101,10 +101,15 @@ def load_function(path: Path, function_name: str = None, compute_units=None):
 class DoryRuntime:
     """The five components, driven the way spec D6 says they are called."""
 
+    #: None unless the package ships the exported RoPE rows (rope_tables_as_inputs).
+    #: A class default so a runtime built without __init__ (the tests) still answers.
+    rope_tables = None
+
     def __init__(self, model_dir, compute_units=None, verbose=True):
         self.model_dir = Path(model_dir)
         self.meta = read_meta(self.model_dir / "meta.yaml")
         self.params = self.meta["parameters"]
+        self.rope_tables = self._load_rope_tables()
         self.verbose = verbose
         self.compute_units = compute_units
         self.models = {}
@@ -117,6 +122,54 @@ class DoryRuntime:
         self.reset_state()
         self.predict_seconds = 0.0
         self.predict_calls = 0
+
+    def _load_rope_tables(self):
+        """The cos/sin rows the converter exported beside the package, if any.
+
+        The converter writes them from the model's own rotary module, so the
+        runtime slices rows and never recomputes the formula: one source of
+        truth, and the graph gets exactly the values its constant table held.
+        """
+        if not self.params.get("rope_tables_as_inputs"):
+            return None
+        declared = self.params.get("rope_tables") or {}
+        name = declared.get("file")
+        if not name:
+            raise RuntimeError(
+                "the meta asks for RoPE tables as inputs but declares no "
+                "parameters.rope_tables.file; reconvert with this converter version")
+        path = self.model_dir / name
+        if not path.is_file():
+            raise RuntimeError(
+                f"{path} is missing: the package was converted with "
+                f"rope_tables_as_inputs and the runtime needs those rows")
+        with np.load(path) as data:
+            tables = {key: np.asarray(data[key]) for key in declared["keys"]}
+        shape = (int(declared["rows"]), int(declared["head_dim"]))
+        for key, array in tables.items():
+            if array.shape != shape:
+                raise RuntimeError(f"{path}: {key} has shape {array.shape}, expected {shape}")
+            if array.dtype != np.float16:
+                tables[key] = array.astype(np.float16)
+        return tables
+
+    def _rope_inputs(self, declared, start: int, q_len: int) -> dict:
+        """The rows this batch needs, sliced from the exported tables."""
+        if self.rope_tables is None:
+            return {}
+        begin, end = int(start), int(start) + int(q_len)
+        out = {}
+        for name in declared:
+            if not (name.startswith("cos_") or name.startswith("sin_")):
+                continue
+            table = self.rope_tables[name]
+            if end > int(table.shape[0]):
+                raise ContextOverflowError(
+                    f"a {q_len}-token batch at {start} needs RoPE rows up to {end} and the "
+                    f"exported table has {int(table.shape[0])}")
+            out[name] = np.ascontiguousarray(
+                table[begin:end].reshape(1, 1, end - begin, int(table.shape[1])))
+        return out
 
     # -- wiring ------------------------------------------------------------
     def _load_models(self):
@@ -224,11 +277,15 @@ class DoryRuntime:
                  if self.meta["components"][name]["kind"] == "blocks"]
         for name in order:
             declared = self.meta["components"][name].get("inputs") or []
-            if any(n.startswith("cos_") or n.startswith("sin_") for n in declared):
+            if (any(n.startswith("cos_") or n.startswith("sin_") for n in declared)
+                    and self.rope_tables is None):
                 raise RuntimeError(
-                    f"component {name} was converted with --rope-tables-as-inputs, and this "
-                    f"runtime does not yet compute the cos/sin rows to feed it; convert "
-                    f"without that flag until the runtime supplies them")
+                    f"component {name} was converted with rope tables as inputs and this "
+                    f"package carries none; reconvert, or convert without that option")
+        rope_inputs = self._rope_inputs(
+            [n for name in order
+             for n in (self.meta["components"][name].get("inputs") or [])
+             if n.startswith("cos_") or n.startswith("sin_")], start, q_len)
         hidden = np.ascontiguousarray(hidden, dtype=np.float16)
         index = 0
         while index < len(order):
@@ -246,6 +303,8 @@ class DoryRuntime:
                                   "current_pos": pos, "cache_pos": cache_pos}
                         inputs.update(self._write_inputs(self.meta["components"][name],
                                                          start, q_len))
+                        inputs.update({key: value for key, value in rope_inputs.items()
+                                       if key in (self.meta["components"][name].get("inputs") or [])})
                         if self.meta["components"][name]["loop_entry"]:
                             inputs["h_in"] = h_in
                         hidden = self._predict(name, inputs, function)["output_hidden_states"]
@@ -253,6 +312,8 @@ class DoryRuntime:
             inputs = {"hidden_states": hidden, "causal_mask": mask,
                       "current_pos": pos, "cache_pos": cache_pos}
             inputs.update(self._write_inputs(entry, start, q_len))
+            inputs.update({key: value for key, value in rope_inputs.items()
+                           if key in (entry.get("inputs") or [])})
             hidden = self._predict(order[index], inputs, function)["output_hidden_states"]
             index += 1
         return hidden
