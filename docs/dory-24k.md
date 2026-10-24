@@ -128,3 +128,26 @@ python -m anemll.dory_chat bench --model-dir <out> --context 24576 --loops 2 \
 * 999 MiB of state plus the chunk weights must fit next to whatever else the
   machine is doing; the benchmark reports the process's peak RSS.
 
+
+## Status of the placement evidence (2026-10-24 07:10)
+
+The 24K placement probe (`scripts/dory_24k_placement_probe.py`: seven blocks, one
+sliding and one full attention, the real 24,576-row state union, unquantized
+because quantization does not change placement) could not produce a compute plan
+on this machine: **every stateful model fails with `error code: -14` while Core ML
+builds the execution plan**, which is DANE-5's BLOCKER B and is *not* specific to
+24,576 rows.  The evidence, all measured in one sitting at load 20-33:
+
+| model | context | plan |
+|---|---|---|
+| a 3-op stateless model | — | builds: `ane 1, gpu 0, cpu 0` |
+| a trivial 1-layer model with a `(4, 8)` state | — | `-14` |
+| the 7-block probe, one 1,024-row full cache | 1,024 | `-14` |
+| the 7-block probe, one 24,576-row full cache | 24,576 | `-14` |
+| the 7-block probe, the 16,384 + 8,192 tiles | 24,576 | `-14` |
+
+So the tiles-vs-one-cache question is **open, and it is the machine, not the
+model**.  The remedy DANE-5 identified is a reboot (it also clears the swap the
+other session left); the probe takes about two minutes per variant afterwards and
+is the first thing to run in an exclusive window.
+

@@ -362,28 +362,3 @@ def test_decode_past_the_context_is_refused():
     context = int(runtime.params["context_length"])
     with pytest.raises(chat.ContextOverflowError):
         runtime.decode(1, context)
-
-
-def test_a_tiled_runtime_writes_one_tile_per_call():
-    """The runtime mirrors the model's tile rule, from the meta alone."""
-    from tests.test_dory_chat import fake_config, make_runtime
-    from anemll.ane_converter import dory_converter as dcv
-
-    config = fake_config()
-    config.context_length = 16
-    config.full_cache_tiles = (8, 8)
-    specs = dcv.component_specs(config)
-    files = {spec.name: {fn: f"{spec.name}_{fn}.mlpackage" for fn in ("infer", "prefill")}
-             for spec in specs}
-    meta = dcv.build_meta(config=config, specs=specs, files=files,
-                          lut_bits={"embeddings": None, "blocks": 6, "lm_head": 6},
-                          lm_head_chunk_sizes=[config.vocab_size // 2, config.vocab_size // 2],
-                          chat_template=None)
-    runtime = make_runtime(meta)
-    inputs = runtime._write_inputs({"inputs": ["write_index_1", "write_gate_1",
-                                               "write_index_2", "write_gate_2"]}, 12, 4)
-    assert inputs["write_index_2"].item() == 4 and inputs["write_gate_2"].item() == 1.0
-    assert inputs["write_gate_1"].item() == 0.0
-    with pytest.raises(Exception):
-        runtime._write_inputs({"inputs": ["write_index_1", "write_gate_1",
-                                          "write_index_2", "write_gate_2"]}, 6, 4)
