@@ -676,3 +676,19 @@ def test_full_cache_is_addressed_by_absolute_position(tmp_path, tiny_weights):
     # agrees to ~1e-6
     worst = (a - b).abs().max().item()
     assert worst < 1e-5 * b.abs().max().item(), (worst, b.abs().max().item())
+
+def test_reset_caches_keeps_the_loop_selection(tmp_path, tiny_weights):
+    """A harness bug: reset_caches() cleared the loop count, so a gate that
+    selected 1 or 4 loops silently ran the default 2."""
+    model = _build_model(tmp_path, tiny_weights, fold_scales=True)
+    ids = [3, 5, 7, 11]
+    one = model.prefill(ids, 0, loops=1).detach()
+    model.reset_caches()                       # must not change the loop count
+    again = model.prefill(ids, 0).detach()     # no explicit loops argument
+    assert torch.allclose(one, again, atol=0), (one - again).abs().max().item()
+
+    four = model.prefill(ids, 0, loops=4).detach()
+    model.reset_caches()
+    still_four = model.prefill(ids, 0).detach()
+    assert torch.allclose(four, still_four, atol=0), (four - still_four).abs().max().item()
+    assert not torch.allclose(one, four, atol=1e-3), "loops 1 and 4 must differ"

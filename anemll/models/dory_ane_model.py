@@ -576,8 +576,10 @@ class DoryANEForCausalLM(nn.Module):
         return changed
 
     def reset_caches(self) -> None:
+        """Empty the caches.  The selected loop count is not part of the cache
+        contents, so it survives: clearing it here silently reverted every
+        caller to the default loop count."""
         self.model.reset_caches()
-        self._active_loops = None
 
     # -- device / masks ---------------------------------------------------
     @property
@@ -653,7 +655,8 @@ class DoryANEForCausalLM(nn.Module):
 
     def _resolve_loops(self, loops: Optional[int]) -> int:
         if loops is None:
-            loops = self._active_loops if self._active_loops is not None else 2
+            loops = (self._active_loops if self._active_loops is not None
+                     else self.loops)
         self.set_loops(loops)
         return int(loops)
 
