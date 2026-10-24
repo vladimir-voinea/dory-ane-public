@@ -218,18 +218,21 @@ def run_recall(backend, prompt, max_tokens=64, stop_ids=(), record=None) -> dict
     logits = backend.prefill(prompt["ids"])
     prefill_seconds = time.time() - started
     generated = []
+    # pos is the row the token just sampled occupies; the decode that consumes it
+    # must use that row and only then advance.  See dory_chat.generate.
     pos = len(prompt["ids"])
     steps = 0
+    stop = set(int(t) for t in stop_ids)
     while steps < int(max_tokens):
         token = int(np.argmax(np.asarray(logits).reshape(-1)))
-        if token in set(int(t) for t in stop_ids):
+        if token in stop:
             break
         generated.append(token)
-        pos += 1
         steps += 1
         if steps >= int(max_tokens) or pos >= backend.context - 1:
             break
         logits = backend.decode(token, pos)
+        pos += 1
     return {"generated": generated, "prefill_seconds": prefill_seconds,
             "answer_logits_last": True, "record": record}
 
