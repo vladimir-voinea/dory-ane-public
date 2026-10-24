@@ -25,7 +25,8 @@ from anemll.eval.kld import (LogprobSource, array_source, read_candidate_npz,
 from anemll.models.dory_ane_model import DoryANEConfig, DoryANEForCausalLM
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scripts.dory_ane_score import DEFAULT_WEIGHTS, log_softmax  # noqa: E402
+from scripts.dory_ane_score import (  # noqa: E402
+    DEFAULT_WEIGHTS, MAX_MEAN_KLD, MIN_TOP1, judge, judge_text, log_softmax)
 
 REFS = os.path.expanduser("~/dev/dory-ane-artifacts/refs")
 ARTIFACTS = os.path.expanduser("~/dev/dory-ane-artifacts/DANE-4")
@@ -33,6 +34,46 @@ ARTIFACTS = os.path.expanduser("~/dev/dory-ane-artifacts/DANE-4")
 
 def loadavg():
     return os.getloadavg()[0]
+
+
+def summarize(results, max_kld=MAX_MEAN_KLD, min_top1=MIN_TOP1):
+    """Print PASS/FAIL per gate and return the exit code (1 if any gate failed).
+
+    It reads only what the run recorded, so the exit status cannot disagree with
+    the numbers in the JSON: a gate with no score (missing reference) and a gate
+    over the threshold are both failures.
+    """
+    failed = []
+    print("", flush=True)
+    print(f"{'gate':16s} {'rows':>6s} {'mean KLD':>10s} {'top-1':>8s}  verdict", flush=True)
+    for entry in results:
+        name = f"{entry['gate']}chunk{entry.get('chunk', 0)}"
+        if entry.get("skipped"):
+            failed.append(f"{name}: {entry['skipped']}")
+            print(f"{name:16s} {entry['rows']:6d} {'-':>10s} {'-':>8s}  "
+                  f"FAIL ({entry['skipped']})", flush=True)
+            continue
+        if "mean_kld" not in entry:
+            failed.append(f"{name}: no score recorded")
+            print(f"{name:16s} {entry['rows']:6d} {'-':>10s} {'-':>8s}  FAIL (no score)",
+                  flush=True)
+            continue
+        passed, failures = judge(entry["mean_kld"], entry["top1"], max_kld, min_top1)
+        entry["gate_passed"] = passed
+        entry["gate_failures"] = failures
+        if not passed:
+            failed.append(f"{name}: " + "; ".join(failures))
+        print(f"{name:16s} {entry['rows']:6d} {entry['mean_kld']:10.5f} "
+              f"{100.0 * entry['top1']:7.2f}%  {judge_text(passed, failures)}", flush=True)
+    print("", flush=True)
+    if failed:
+        print(f"GATE SUITE: FAILED ({len(failed)} of {len(results)} gate rows)", flush=True)
+        for line in failed:
+            print("  -", line, flush=True)
+        return 1
+    print(f"GATE SUITE: PASSED (every row within mean KLD <= {max_kld:g}, "
+          f"top-1 >= {100.0 * min_top1:.2f} %)", flush=True)
+    return 0
 
 
 def gate_rows(mode, window):
@@ -147,7 +188,8 @@ def score(logprobs, positions, tokens, ref_path, name, out_dir, save_candidate=F
     return score_sources(sliced, cand)
 
 
-def main(argv=None):
+def build_parser():
+    """The command line, kept out of the work so it can be read and tested."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--weights", default=DEFAULT_WEIGHTS)
     ap.add_argument("--rows-mode", choices=("window", "full"), default="window",
@@ -164,7 +206,15 @@ def main(argv=None):
     ap.add_argument("--save-candidates", action="store_true",
                     help="also write the candidate npz (1 GB each; off by default)")
     ap.add_argument("--artifacts", default=ARTIFACTS)
-    args = ap.parse_args(argv)
+    ap.add_argument("--max-kld", type=float, default=MAX_MEAN_KLD,
+                    help=f"mean KLD gate (default {MAX_MEAN_KLD}); the exit status follows it")
+    ap.add_argument("--min-top1", type=float, default=MIN_TOP1,
+                    help=f"top-1 gate (default {MIN_TOP1}); the exit status follows it")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     torch.set_num_threads(args.threads)
     os.makedirs(args.artifacts, exist_ok=True)
@@ -218,6 +268,11 @@ def main(argv=None):
                             save_candidate=args.save_candidates)
                 entry.update({"mean_kld": res.mean_kld, "top1": res.top1_agreement,
                               "kld_max": res.kld_max, "kld_p90": res.kld_p90})
+                part_passed, part_failures = judge(res.mean_kld, res.top1_agreement,
+                                                   args.max_kld, args.min_top1)
+                entry["gate_passed"] = part_passed
+                entry["gate_failures"] = part_failures
+                entry["verdict"] = judge_text(part_passed, part_failures)
                 print(f"[{time.strftime('%H:%M:%S')}] {name} chunk{part['chunk']} "
                       f"{entry['row_range']}: rows={n} mean_kld={res.mean_kld:.5f} "
                       f"top1={100 * res.top1_agreement:.2f}% max={res.kld_max:.3f} "
@@ -229,7 +284,10 @@ def main(argv=None):
             results.append(entry)
             with open(args.out_json, "w") as fh:
                 json.dump(results, fh, indent=2)
-    return 0
+    code = summarize(results, args.max_kld, args.min_top1)
+    with open(args.out_json, "w") as fh:
+        json.dump(results, fh, indent=2)
+    return code
 
 
 if __name__ == "__main__":
