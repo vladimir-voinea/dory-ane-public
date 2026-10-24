@@ -537,11 +537,19 @@ def measure_speed(model_dir, config: str, contexts: Sequence[int], loops_list: S
 # measurements: the GPU build (llama.cpp, Q8_0, last_loop)
 # ---------------------------------------------------------------------------
 
-def gpu_completion(port: int, prompt: str, n_predict: int) -> dict:
-    """One non-streaming /completion; its timings are the measurement."""
+def gpu_completion(port: int, prompt_ids: Sequence[int], n_predict: int) -> dict:
+    """One non-streaming /completion, fed token ids, not text.
+
+    The Neural Engine side feeds exactly workload_ids(context) token ids; a
+    character slice of some text would tokenise to a different length and a
+    different content, and the head-to-head table would compare two workloads.
+    llama.cpp's server accepts a prompt as an array of token ids, which makes
+    both sides literally the same input.
+    """
     import urllib.request
 
-    body = json.dumps({"prompt": prompt, "n_predict": int(n_predict),
+    body = json.dumps({"prompt": [int(token) for token in prompt_ids],
+                       "n_predict": int(n_predict),
                        "temperature": 0.0, "stream": False}).encode()
     request = urllib.request.Request(
         f"http://127.0.0.1:{int(port)}/completion", data=body,
@@ -566,14 +574,25 @@ def wait_for_server(port: int, timeout_seconds: float = 1800.0) -> None:
     raise SystemExit(f"llama-server did not answer on port {port} within {timeout_seconds:.0f}s")
 
 
-def gpu_prompt_text(minimum: int) -> str:
-    """The same fixed evaluation text the Neural Engine side tokenises."""
-    text_file = REPO_ROOT / "tests" / "fixtures" / "dory_eval" / "eval_text.txt"
-    if text_file.is_file():
-        text = text_file.read_text()
-    else:                                               # pragma: no cover
-        text = "The quick brown fox jumps over the lazy dog. "
-    return text * (1 + int(minimum) // max(len(text), 1))
+def gpu_prompt_tokens(context: int) -> List[int]:
+    """The token ids the Neural Engine side feeds at this context.
+
+    Not "the same text": the same ids, produced by the same function.  Anything
+    else (a character slice of some prompt text) tokenises to a different
+    sequence, and the two columns of the head-to-head table would not be
+    measuring the same workload.
+    """
+    return [int(token) for token in workload_ids(int(context))]
+
+
+def check_prompt_count(timings: dict, expected: int, context: int) -> None:
+    """Refuse a row whose server-side prompt length differs from what was sent."""
+    reported = timings.get("prompt_n")
+    if reported is None or int(reported) != int(expected):
+        raise SystemExit(
+            f"GPU row at {context} tokens: the server counted {reported} prompt tokens "
+            f"but {expected} were sent.  Refusing to record a workload the Neural "
+            f"Engine side did not measure.")
 
 
 def measure_gpu(gguf, contexts: Sequence[int], loops_list: Sequence[int], *,
@@ -584,7 +603,7 @@ def measure_gpu(gguf, contexts: Sequence[int], loops_list: Sequence[int], *,
 
     binary = llama_server or os.path.expanduser(
         "~/.unsloth/llama.cpp-dory/build/bin/llama-server")
-    prompt = gpu_prompt_text(max(int(value) for value in contexts))
+    prompts = {int(context): gpu_prompt_tokens(int(context)) for context in contexts}
     out: Dict[str, dict] = {}
     for loops in loops_list:
         process = subprocess.Popen(
@@ -597,8 +616,10 @@ def measure_gpu(gguf, contexts: Sequence[int], loops_list: Sequence[int], *,
         try:
             wait_for_server(int(port))
             for context in contexts:
-                reply = gpu_completion(int(port), prompt[:int(context)], int(tokens))
+                ids = prompts[int(context)]
+                reply = gpu_completion(int(port), ids, int(tokens))
                 timings = reply.get("timings") or {}
+                check_prompt_count(timings, len(ids), int(context))
                 try:
                     peak = int(psutil.Process(process.pid).memory_info().rss)
                 except psutil.Error:                    # pragma: no cover
@@ -606,7 +627,7 @@ def measure_gpu(gguf, contexts: Sequence[int], loops_list: Sequence[int], *,
                 out[speed_key("gpu", GPU_CONFIG, int(context), int(loops))] = {
                     "decode_tok_s": float(timings.get("predicted_per_second", "nan")),
                     "prefill_tok_s": float(timings.get("prompt_per_second", "nan")),
-                    "prompt_tokens": int(timings.get("prompt_n", 0)),
+                    "prompt_tokens": len(ids),
                     "decoded_tokens": int(timings.get("predicted_n", 0)),
                     "peak_rss_bytes": peak,
                 }
