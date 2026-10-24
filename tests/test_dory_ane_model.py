@@ -643,3 +643,36 @@ def test_split_lm_head_matches_a_single_head(tmp_path, tiny_weights, parts):
     a = split.prefill(ids, 0, loops=2).detach()
     b = single.prefill(ids, 0, loops=2).detach()
     assert torch.allclose(a, b, rtol=1e-4, atol=1e-4), (a - b).abs().max().item()
+
+
+def test_full_cache_is_addressed_by_absolute_position(tmp_path, tiny_weights):
+    """Caught a real bug: a full cache must not use the sliding ring offset.
+
+    Two configs, same weights, same tokens: the small ring (256 rows) makes
+    cache_pos = position mod 256 diverge from the position, the big ring
+    (1,088 rows) keeps them equal for these 300 tokens.  The sliding window is
+    64 in both, so the attention sets -- and therefore the results -- must be
+    identical.  A full cache written at the ring offset breaks that equality,
+    which is exactly the long-context failure the 4,094-row gate exposed.
+    """
+    weights = _damped(tiny_weights)      # contractive, so rounding cannot mask a wiring bug
+    path = str(tmp_path / "tiny.safetensors")
+    _write_safetensors(path, weights)
+    small = dm.DoryANEForCausalLM(dm.DoryANEConfig(
+        **dict(TINY, context_length=512, sliding_window=64, batch_size=4, fold_scales=True)))
+    big = dm.DoryANEForCausalLM(dm.DoryANEConfig(
+        **dict(TINY, context_length=512, sliding_window=64, batch_size=1024,
+               fold_scales=True)))
+    small.load_pretrained_weights(path)
+    big.load_pretrained_weights(path)
+    assert small.config.sliding_rows == 256 < 512
+    assert big.config.sliding_rows > 300
+
+    ids = [((i * 37) % 120) + 1 for i in range(300)]
+    a = torch.cat([small.decode_step(tok, i, loops=1) for i, tok in enumerate(ids)], dim=1)
+    b = torch.cat([big.decode_step(tok, i, loops=1) for i, tok in enumerate(ids)], dim=1)
+    # the bug this guards against put the wrong rows in the full cache, which
+    # moves the logits by ~1e-3 even with a damped residual; correct wiring
+    # agrees to ~1e-6
+    worst = (a - b).abs().max().item()
+    assert worst < 1e-5 * b.abs().max().item(), (worst, b.abs().max().item())

@@ -330,8 +330,12 @@ class DoryANEAttention(nn.Module):
         q = self.q_norm(q) * self.sq.view(1, h, 1, d)               # L2 then sqk
         k = self.k_norm(k)
 
-        # -- write the current rows, then read the whole (static-width) slot
-        dc.write_cache_rows(cache, slot, k, v, cache_pos, num_slots)
+        # -- write the current rows, then read the whole (static-width) slot.
+        # A full cache is addressed by absolute position; only a sliding cache
+        # uses the ring offset.  (They coincide until context_length exceeds
+        # sliding_rows, which is why a short-context test cannot see this.)
+        write_start = current_pos if self.is_full else cache_pos
+        dc.write_cache_rows(cache, slot, k, v, write_start, num_slots)
         key_cache, value_cache = dc.read_cache_slot(cache, slot, num_slots, mask.shape[-1])
 
         # -- grouped-query attention by reshaping the queries per KV head
