@@ -113,6 +113,9 @@ is Gemma 3's (`gemma3_converter.py:341-371`, `:1474-1481`).
     python -m anemll.dory_chat score --model-dir <dir> --chunk-size 1024 \
         --loops 2 --out cand.npz --reference <decode reference>.kld
 
+    # the OpenAI-compatible server (spec D10; see docs/dory_server.md)
+    python -m anemll.openai_server --model-dir <dir> --port 8000
+
 Mid-session commands: `/loops N` (resets the KV cache and says so -- older rows
 keep the *final* loop's K/V, so a change must start from an empty cache),
 `/reset`, `/quit`.
