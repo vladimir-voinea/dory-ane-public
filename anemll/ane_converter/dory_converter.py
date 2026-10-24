@@ -1,0 +1,1284 @@
+"""Convert Dory1.0-4B into the five multifunction Core ML chunks of spec D6.
+
+One command: scripts/convert_dory.py.  This module holds the parts:
+
+1. the component plan -- embeddings, input (blocks 0-15), recurrent (16-55),
+   output (56-71), LM head split into even parts -- with explicit, structurally
+   chosen layer ranges instead of ANEMLL's balanced split (spec D6; the
+   balanced formula in llama_converter.py:761-768 does not apply to a model
+   whose blocks are not interchangeable);
+2. the meta-file schema.  ANEMLL 0.3.5 records context length and a chunk count
+   and nothing else: no KV mode, no loop range, no component manifest, no
+   tokenizer or chat template.  Dory needs all of them at run time, so the
+   keys are invented here and validated by validate_meta();
+3. the ~2 GB per-file guard, checked twice: from a parameter count before any
+   conversion starts (so a doomed run costs seconds, not an hour), and again
+   on the bytes the finished .mlpackage actually occupies;
+4. the per-function ANE placement check, which the converter runs itself and
+   which fails the run when any op lands on the GPU or the CPU.
+
+Tracing discipline follows ANEMLL 0.3.5 (llama_converter.py:544-550, :838-847):
+reset the cache buffers, torch.jit.trace, reset them again on both the eager
+module and the traced copy, then ct.convert with the state list, FLOAT16
+precision, CPU_AND_NE, iOS 18 and the mlprogram format.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import coremltools as ct
+from coremltools.optimize.coreml import OptimizationConfig, OpPalettizerConfig
+
+from anemll.ane_converter.base_converter import BaseConverter
+from anemll.ane_converter.metadata import AddMetadata
+from anemll.models import dory_ane_model as dam
+from anemll.models import dory_chunks as dch
+from anemll.utils import dory_caches as dc
+
+__all__ = [
+    "META_FORMAT",
+    "MAX_MODEL_BYTES",
+    "ModelTooLargeError",
+    "PlacementError",
+    "MetaError",
+    "ComponentSpec",
+    "component_specs",
+    "estimate_component_params",
+    "estimate_component_bytes",
+    "check_size",
+    "check_disk",
+    "disk_needed",
+    "build_meta",
+    "validate_meta",
+    "write_meta",
+    "read_meta",
+    "placement_report",
+    "assert_ane_only",
+    "DoryConverter",
+]
+
+#: Version of the meta schema this module writes (see build_meta).
+META_FORMAT = 1
+
+#: What the runtime uses when the weights ship no chat template.  The BF16
+#: checkpoint and the community GGUF both carry the special tokens but no
+#: template (checked: no chat_template in tokenizer_config.json, none in the
+#: GGUF metadata), while NVIDIA's README launches llama.cpp with "--jinja
+#: --reasoning on".  ChatML is what the <|im_start|>/<|im_end|> pair in the
+#: vocabulary means, and an open  thinking block is reasoning on by default.
+FALLBACK_TEMPLATE = "chatml-think"
+
+#: The ANE file limit that matters on this Mac: ~2 GB per Core ML file.
+MAX_MODEL_BYTES = 2 * 1024 ** 3
+
+#: Refuse earlier than the hard limit, so a conversion never ends just over it.
+SIZE_WARN_FRACTION = 0.90
+
+#: Components whose blocks are in the input zone / recurrent zone / output zone.
+MASK_WIDTH = "mask_len"
+
+
+class ModelTooLargeError(RuntimeError):
+    """A Core ML file would exceed the ANE per-file limit."""
+
+
+class PlacementError(RuntimeError):
+    """A converted op did not land on the Neural Engine."""
+
+
+class MetaError(ValueError):
+    """The meta file is missing or contradicts itself."""
+
+
+# ---------------------------------------------------------------------------
+# The component plan
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ComponentSpec:
+    """One Core ML file: what it computes, how often, and which LUT applies.
+
+    calls_per_token is an int or the string 'loops' (the host calls the
+    component once per loop pass).  blocks is (start, end) for block chunks and
+    None for the embedding and LM-head components.
+    """
+
+    name: str
+    kind: str                      # "embeddings" | "blocks" | "lm_head"
+    blocks: Optional[tuple] = None
+    loop_entry: bool = False
+    loop_exit: bool = False
+    calls_per_token: object = 1
+    lut_role: str = "blocks"
+
+    @property
+    def inputs(self) -> list:
+        if self.kind == "embeddings":
+            return ["input_ids"]
+        if self.kind == "lm_head":
+            return ["hidden_states"]
+        names = ["hidden_states", "causal_mask", "current_pos", "cache_pos"]
+        if self.loop_entry:
+            names.append("h_in")
+        return names
+
+    @property
+    def is_recurrent(self) -> bool:
+        return self.loop_entry or self.loop_exit
+
+
+def component_specs(config, recurrent_splits: int = 1) -> list:
+    """The five components of spec D6, in run order.
+
+    With recurrent_splits > 1 the recurrent block (blocks 16-55) becomes two or
+    more files, each called once per loop pass; the loop entry norm stays on the
+    first and the loop exit norm on the last, so the math is unchanged.
+    """
+    recurrent_splits = int(recurrent_splits)
+    if recurrent_splits < 1:
+        raise ValueError("recurrent_splits must be >= 1")
+    input_end = int(config.input_layer_count)
+    rec_start = input_end
+    rec_end = rec_start + int(config.recurrent_layer_count)
+    num_blocks = int(config.num_hidden_layers)
+    if rec_end > num_blocks:
+        raise ValueError(f"input+recurrent blocks ({rec_end}) exceed the model's "
+                         f"{num_blocks} blocks")
+
+    specs = [ComponentSpec("embeddings", "embeddings", None, calls_per_token=1,
+                           lut_role="embeddings")]
+    specs.append(ComponentSpec("input", "blocks", (0, input_end), calls_per_token=1))
+
+    base, rem = divmod(rec_end - rec_start, recurrent_splits)
+    start = rec_start
+    for i in range(recurrent_splits):
+        end = start + base + (1 if i < rem else 0)
+        name = "recurrent" if recurrent_splits == 1 else f"recurrent_{i + 1}of{recurrent_splits}"
+        specs.append(ComponentSpec(
+            name, "blocks", (start, end),
+            loop_entry=(i == 0),
+            loop_exit=(i == recurrent_splits - 1),
+            calls_per_token="loops"))
+        start = end
+
+    specs.append(ComponentSpec("output", "blocks", (rec_end, num_blocks), calls_per_token=1))
+    specs.append(ComponentSpec("lm_head", "lm_head", None, calls_per_token=1,
+                               lut_role="lm_head"))
+    return specs
+
+
+def block_params(config, block: int) -> int:
+    """Parameters of one physical block (attention or MLP)."""
+    h = int(config.hidden_size)
+    inter = int(config.intermediate_size)
+    nh = int(config.num_attention_heads)
+    nkv = int(config.num_key_value_heads)
+    hd = int(config.head_dim)
+    if dc.block_is_mlp(block):
+        return 3 * h * inter
+    return h * nh * hd + 2 * h * nkv * hd + nh * hd * h + h * nh * hd
+
+
+def estimate_component_params(spec: ComponentSpec, config) -> int:
+    """Parameters one component holds, used by the size guard before converting."""
+    if spec.kind == "embeddings" or spec.kind == "lm_head":
+        return int(config.vocab_size) * int(config.hidden_size)
+    if spec.blocks is None:
+        raise ValueError(f"component {spec.name} has no block range")
+    return sum(block_params(config, b) for b in range(spec.blocks[0], spec.blocks[1]))
+
+
+def estimate_component_bytes(spec: ComponentSpec, config, lut_bits) -> int:
+    """Rough on-disk size of a converted component, in bytes.
+
+    A palettized weight costs lut_bits, plus one fp16 scale per group of
+    per_grouped_channel weights (16 bits / 8 weights = 2 bits), plus the small
+    LUT tables and the fp16 non-weight tensors; 5 % is added for those.  An
+    unpalettized (None) component is fp16.
+    """
+    params = estimate_component_params(spec, config)
+    if lut_bits is None:
+        return int(params * 2 * 1.02)
+    # coremltools palettizes per grouped channel over a group of 16 weights, so
+    # the fp16 scale costs one bit per 16 weights, not one scale per 8.  Measured
+    # on the lm_head package: 335.5M params -> 242 MiB = 0.759 B/param (6.07 bits).
+    return int(params * (int(lut_bits) + 1 / 16.0) / 8.0 * 1.02)
+
+
+def disk_needed(estimates) -> int:
+    """Disk a conversion needs on top of the model it writes.
+
+    Components convert one at a time, so the peak is the largest component
+    tripled (unquantized function package + quantized function package + the
+    welded multifunction package) plus a gigabyte of slack, not the sum of all
+    five.
+    """
+    sizes = [int(size) for _, size in estimates]
+    if not sizes:
+        return 0
+    return int(max(sizes) * 3.2) + 1024 ** 3
+
+
+def check_disk(path, estimates, reserve_bytes: int = 2 * 1024 ** 3) -> dict:
+    """Refuse to start a conversion that would leave the volume under 2 GB.
+
+    There is one volume and it is shared with the rest of the port (references,
+    tests, other tickets' artifacts), so the guard is on the *free* space left
+    after the conversion, not on the conversion's own size.
+    """
+    needed = disk_needed(estimates)
+    usage = shutil.disk_usage(str(path))
+    free = int(usage.free)
+    if free - needed < reserve_bytes:
+        raise RuntimeError(
+            f"not enough disk: {free / 1024 ** 3:.1f} GB free, this conversion "
+            f"needs about {needed / 1024 ** 3:.1f} GB and must leave "
+            f"{reserve_bytes / 1024 ** 3:.0f} GB for the rest of the port. Free "
+            f"space (delete a superseded package or a reference) and run again.")
+    return {"free": free, "needed": needed}
+
+
+def nearest_existing(path) -> Path:
+    """The closest ancestor of path that exists -- disk_usage needs one."""
+    path = Path(path)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def check_size(label: str, size_bytes: int, limit_bytes: int = MAX_MODEL_BYTES) -> int:
+    """Raise ModelTooLargeError when a component would not fit in one file.
+
+    The message has to be actionable: it names the limit, the estimate, and the
+    flag that fixes it (a wider recurrence split, a narrower LUT, or both).
+    """
+    if size_bytes <= limit_bytes:
+        return size_bytes
+    gb = size_bytes / 1024 ** 3
+    limit_gb = limit_bytes / 1024 ** 3
+    raise ModelTooLargeError(
+        f"{label} would be about {gb:.2f} GB, over the {limit_gb:.1f} GB Core ML "
+        f"per-file limit that the Neural Engine requires. Fix it with either "
+        f"--recurrent-splits 2 (splits the recurrent block into two files, each "
+        f"called once per loop) or a narrower LUT (--lut-blocks 4), then run "
+        f"again. Nothing was written."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The meta file: what ANEMLL 0.3.5 does not record and the runtime needs
+# ---------------------------------------------------------------------------
+
+def _lut_value(bits):
+    """Normalise a LUT argument to an int or None (unquantized)."""
+    if bits in (None, "", "none", "None", 0, "0"):
+        return None
+    return int(bits)
+
+
+def _state_descriptions(config) -> list:
+    """The two Core ML states, with their shapes and byte cost."""
+    full_shape, sliding_shape = dc.cache_shapes(
+        config.context_length, config.num_key_value_heads, config.head_dim,
+        config.sliding_window, config.batch_size)
+    names = dch.state_names()
+    out = []
+    for attr, name, shape, kind, slots in (
+            ("kv_cache_full", names[0], full_shape, "full", config.num_full_caches),
+            ("kv_cache_sliding", names[1], sliding_shape, "sliding", config.num_sliding_caches)):
+        elements = int(np.prod(shape))
+        out.append({
+            "name": name,
+            "buffer": attr,
+            "kind": kind,
+            "slots": int(slots),
+            "shape": [int(d) for d in shape],
+            "rows": int(shape[2]),
+            "dtype": "float16",
+            "bytes": elements * 2,
+        })
+    return out
+
+
+def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="dory",
+               argmax=False, tokenizer="tokenizer.json",
+               chat_template="chat_template.jinja", bos_token_id=1, eos_token_id=11,
+               eos_token_ids=(2, 11), created=None) -> dict:
+    """The meta file: context, chunk layout, LUT widths, KV mode, loop range,
+    tokenizer and chat template.
+
+    keys ANEMLL 0.3.5 has: model_info, parameters.context_length,
+    parameters.batch_size, the lut_* triple, split_lm_head, argmax_in_model.
+    keys invented here (none of them exist upstream): dory_meta (schema
+    version), parameters.state_length / sliding_rows / mask_len / zones /
+    num_full_caches / num_sliding_caches, the whole kv section, the loops
+    section, the tokenizer section, and the components manifest that maps a
+    component name to its file, its functions, its block range and how many
+    times the host calls it per token.
+    """
+    context = int(config.context_length)
+    batch = int(config.batch_size)
+    states = _state_descriptions(config)
+    zone_input = [0, int(config.input_layer_count)]
+    zone_recurrent = [zone_input[1], zone_input[1] + int(config.recurrent_layer_count)]
+    zone_output = [zone_recurrent[1], int(config.num_hidden_layers)]
+
+    components = {}
+    for spec in specs:
+        bits = lut_bits.get(spec.lut_role)
+        entry = {
+            "kind": spec.kind,
+            "files": dict(files[spec.name]),
+            "functions": ["infer", "prefill"] if batch > 1 else ["infer"],
+            "calls_per_token": spec.calls_per_token,
+            "lut": _lut_value(bits),
+            "inputs": list(spec.inputs),
+        }
+        if spec.kind == "blocks":
+            entry["blocks"] = [int(spec.blocks[0]), int(spec.blocks[1])]
+            entry["loop_entry"] = bool(spec.loop_entry)
+            entry["loop_exit"] = bool(spec.loop_exit)
+        if spec.kind == "lm_head":
+            entry["outputs"] = ([f"argmax_idx_{i}" for i in range(1, len(lm_head_chunk_sizes) + 1)]
+                                if argmax else
+                                [f"logits_{i}" for i in range(1, len(lm_head_chunk_sizes) + 1)])
+            entry["splits"] = len(lm_head_chunk_sizes)
+        else:
+            entry["outputs"] = (["output_hidden_states"] if spec.kind == "blocks"
+                                else ["hidden_states"])
+        components[spec.name] = entry
+
+    meta = {
+        "dory_meta": META_FORMAT,
+        "model_info": {
+            "name": f"anemll-{prefix}-ctx{context}",
+            "description": (
+                f"Dory1.0-4B on the Apple Neural Engine: {len(specs)} components, "
+                f"context {context}, prefill batch {batch}, loops 1-4 "
+                f"({config.sliding_window}-token sliding window)."),
+            "architecture": "dory",
+            "framework": "Core ML",
+            "format": "mlprogram",
+            "created": created or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        },
+        "parameters": {
+            "model_prefix": prefix,
+            "context_length": context,
+            "state_length": int(config.state_length),
+            "batch_size": batch,
+            "vocab_size": int(config.vocab_size),
+            "hidden_size": int(config.hidden_size),
+            "intermediate_size": int(config.intermediate_size),
+            "num_hidden_layers": int(config.num_hidden_layers),
+            "num_attention_heads": int(config.num_attention_heads),
+            "num_key_value_heads": int(config.num_key_value_heads),
+            "head_dim": int(config.head_dim),
+            "sliding_window": int(config.sliding_window),
+            "sliding_rows": int(config.sliding_rows),
+            "mask_len": int(config.mask_len),
+            "zones": {"input": zone_input, "recurrent": zone_recurrent,
+                      "output": zone_output},
+            "full_attention_blocks": list(dc.full_attention_blocks()),
+            "sliding_attention_blocks": list(dc.sliding_attention_blocks()),
+            "num_full_caches": int(config.num_full_caches),
+            "num_sliding_caches": int(config.num_sliding_caches),
+            "num_chunks": len(specs),
+            "split_lm_head": len(lm_head_chunk_sizes),
+            "lm_head_chunk_sizes": [int(s) for s in lm_head_chunk_sizes],
+            "argmax_in_model": bool(argmax),
+            "lut_embeddings": _lut_value(lut_bits.get("embeddings")),
+            "lut_blocks": _lut_value(lut_bits.get("blocks")),
+            "lut_lm_head": _lut_value(lut_bits.get("lm_head")),
+            "lut_per_channel": 8,
+        },
+        "kv": {
+            "mode": "last_loop",
+            "dtype": "float16",
+            "write_scheme": "ring",
+            "invalidate_on_loop_change": True,
+            "states": states,
+        },
+        "loops": {"min": 1, "max": 4, "default": 2},
+        "tokenizer": {
+            "file": tokenizer,
+            "chat_template": chat_template,
+            "chat_template_fallback": None if chat_template else FALLBACK_TEMPLATE,
+            "reasoning_default": True,
+            "reasoning_marker": "think",
+            "bos_token_id": int(bos_token_id),
+            "eos_token_id": int(eos_token_id),
+            "eos_token_ids": [int(t) for t in eos_token_ids],
+        },
+        "components": components,
+        "run_order": [spec.name for spec in specs],
+    }
+    return meta
+
+
+def validate_meta(meta) -> list:
+    """Every way the meta file can be wrong, as a list of human sentences.
+
+    The runtime calls this on load, so a broken conversion is a message and not
+    a garbage answer; the converter calls it on write, so a broken schema never
+    reaches disk.
+    """
+    problems = []
+
+    def need(cond, message):
+        if not cond:
+            problems.append(message)
+
+    if not isinstance(meta, dict):
+        return ["the meta file is not a mapping"]
+    need(meta.get("dory_meta") == META_FORMAT,
+         f"dory_meta must be {META_FORMAT}, got {meta.get('dory_meta')!r}")
+    params = meta.get("parameters") or {}
+    context = params.get("context_length")
+    need(isinstance(context, int) and context > 0, "parameters.context_length must be a positive int")
+    batch = params.get("batch_size")
+    need(isinstance(batch, int) and batch >= 1, "parameters.batch_size must be >= 1")
+    sliding_rows = params.get("sliding_rows")
+    mask_len = params.get("mask_len")
+    if isinstance(context, int) and isinstance(sliding_rows, int) and isinstance(mask_len, int):
+        need(mask_len == context + sliding_rows,
+             f"parameters.mask_len ({mask_len}) must be context_length + sliding_rows "
+             f"({context} + {sliding_rows})")
+        need(sliding_rows >= min(context, params.get("sliding_window") or sliding_rows),
+             "parameters.sliding_rows is smaller than the sliding window it must hold")
+
+    loops = meta.get("loops") or {}
+    lo, hi, default = loops.get("min"), loops.get("max"), loops.get("default")
+    need(isinstance(lo, int) and isinstance(hi, int) and isinstance(default, int),
+         "loops.min / loops.max / loops.default must be ints")
+    if isinstance(lo, int) and isinstance(hi, int) and isinstance(default, int):
+        need(1 <= lo <= default <= hi, "loops must satisfy 1 <= min <= default <= max")
+
+    kv = meta.get("kv") or {}
+    need(kv.get("mode") == "last_loop",
+         f"kv.mode must be 'last_loop', got {kv.get('mode')!r}")
+    states = kv.get("states") or []
+    need(len(states) == 2, f"kv.states must declare the two cache buffers, got {len(states)}")
+    for state in states:
+        need(bool(state.get("name")), "every kv state needs a name")
+        need(isinstance(state.get("shape"), list) and state.get("shape"),
+             f"kv state {state.get('name')} needs a shape")
+
+    tokenizer = meta.get("tokenizer") or {}
+    need(bool(tokenizer.get("file")), "tokenizer.file is required")
+    need("chat_template" in tokenizer,
+         "tokenizer.chat_template must be present (a file name, or null with a fallback)")
+    need(bool(tokenizer.get("chat_template")) or bool(tokenizer.get("chat_template_fallback")),
+         "either tokenizer.chat_template or tokenizer.chat_template_fallback is required")
+
+    components = meta.get("components") or {}
+    order = meta.get("run_order") or []
+    need(isinstance(components, dict), "components must be a mapping")
+    need(list(order) == list(components.keys()),
+         "run_order must list every component, in order")
+    if order:
+        need(order[0] == "embeddings", "embeddings must run first")
+        need(order[-1] == "lm_head", "lm_head must run last")
+    covered = set()
+    for name, comp in components.items():
+        comp_files = comp.get("files") or {}
+        need(isinstance(comp_files, dict) and bool(comp_files),
+             f"component {name} needs a files mapping")
+        funcs = comp.get("functions") or []
+        for function in funcs:
+            need(bool(comp_files.get(function)),
+                 f"component {name} needs a file for its {function} function")
+        need("infer" in funcs, f"component {name} must provide the infer function")
+        if batch and batch > 1:
+            need("prefill" in funcs, f"component {name} must provide the prefill function")
+        calls = comp.get("calls_per_token")
+        need(isinstance(calls, int) or calls == "loops",
+             f"component {name} calls_per_token must be an int or 'loops'")
+        if comp.get("kind") == "blocks":
+            blocks = comp.get("blocks") or []
+            need(len(blocks) == 2 and blocks[1] > blocks[0],
+                 f"component {name} needs a block range")
+            if len(blocks) == 2:
+                covered.update(range(blocks[0], blocks[1]))
+                if comp.get("loop_entry") or comp.get("loop_exit"):
+                    need(calls == "loops",
+                         f"recurrent component {name} must be called once per loop")
+                else:
+                    need(calls == 1, f"component {name} must be called once per token")
+    n_blocks = params.get("num_hidden_layers")
+    if isinstance(n_blocks, int) and covered:
+        need(sorted(covered) == list(range(n_blocks)),
+             f"the block components must cover blocks 0..{n_blocks - 1}, "
+             f"covered {len(covered)}")
+
+    head = components.get("lm_head") or {}
+    sizes = params.get("lm_head_chunk_sizes") or []
+    vocab = params.get("vocab_size")
+    if sizes and isinstance(vocab, int):
+        need(len(sizes) == params.get("split_lm_head"),
+             "lm_head_chunk_sizes must match split_lm_head")
+        need(sum(sizes) == vocab,
+             f"lm_head_chunk_sizes must sum to vocab_size ({sum(sizes)} != {vocab})")
+        need(head.get("splits") == len(sizes),
+             "the lm_head component must declare its splits")
+    return problems
+
+
+def write_meta(path, meta) -> Path:
+    """Write meta.yaml (and refuse to write an invalid one)."""
+    import yaml
+
+    problems = validate_meta(meta)
+    if problems:
+        raise MetaError("refusing to write an invalid meta file: " + "; ".join(problems))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(meta, handle, sort_keys=False, width=100)
+    return path
+
+
+def read_meta(path):
+    """Read and validate meta.yaml."""
+    import yaml
+
+    with open(path, "r", encoding="utf-8") as handle:
+        meta = yaml.safe_load(handle)
+    problems = validate_meta(meta)
+    if problems:
+        raise MetaError("invalid meta file " + str(path) + ": " + "; ".join(problems))
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# ANE placement: the converter checks itself
+# ---------------------------------------------------------------------------
+
+def _device_of(usage) -> str:
+    """Classify an MLComputePlan device usage as 'ane', 'gpu', 'cpu' or 'none'."""
+    if usage is None:
+        return "none"
+    text = repr(usage).lower()
+    if "ane" in text or "neural" in text:
+        return "ane"
+    if "gpu" in text or "mps" in text:
+        return "gpu"
+    if "cpu" in text:
+        return "cpu"
+    return "none"
+
+
+def placement_report(model_path) -> dict:
+    """Per-function op placement from Core ML's own compute plan.
+
+    Compiles the package with xcrun coremlcompiler into a scratch directory and
+    walks every operation of every function, asking the compute plan which
+    device it will run on.  Returns {function: {ane, gpu, cpu, none, ops}}.
+    """
+    from coremltools.models.compute_plan import MLComputePlan
+
+    model_path = Path(model_path)
+    tmp = Path(tempfile.mkdtemp(prefix="dory_plan_"))
+    try:
+        if model_path.suffix == ".mlpackage":
+            result = subprocess.run(
+                ["xcrun", "coremlcompiler", "compile", str(model_path), str(tmp)],
+                capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"coremlcompiler failed for {model_path}: "
+                                   f"{result.stderr.strip()[:400]}")
+            compiled = sorted(tmp.glob("*.mlmodelc"))
+            if not compiled:
+                raise RuntimeError(f"no .mlmodelc produced for {model_path}")
+            compiled_path = compiled[0]
+        else:
+            compiled_path = model_path
+        plan = MLComputePlan.load_from_path(str(compiled_path))
+        program = plan.model_structure.program
+        if program is None:
+            raise RuntimeError(f"{model_path} is not an ML program")
+        report = {}
+        for name, function in program.functions.items():
+            counts = {"ane": 0, "gpu": 0, "cpu": 0, "none": 0}
+            fallbacks = []
+            for op in function.block.operations:
+                device = _device_of(plan.get_compute_device_usage_for_mlprogram_operation(op))
+                counts[device] += 1
+                if device in ("gpu", "cpu"):
+                    outputs = getattr(op, "outputs", []) or []
+                    label = outputs[0].name if outputs else getattr(op, "operator_name", "?")
+                    fallbacks.append(f"{getattr(op, 'operator_name', '?')}:{label}")
+            counts["ops"] = sum(v for k, v in counts.items() if k != "ops")
+            counts["fallbacks"] = fallbacks
+            report[name] = counts
+        return report
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def assert_ane_only(report: dict, label: str) -> dict:
+    """Fail unless every function runs its ops on the Neural Engine.
+
+    Two ways to fail, both of them hard: an op attributed to the GPU or the CPU,
+    and a function the compute plan attributed no device to (ane + gpu + cpu ==
+    0).  An empty attribution is not evidence of placement, so it must never
+    read as a pass.
+    """
+    def offending(counts) -> bool:
+        return bool(counts["gpu"] or counts["cpu"]) or not counts["ane"]
+
+    bad = {fn: counts for fn, counts in report.items() if offending(counts)}
+    if not bad:
+        return report
+    lines = []
+    for fn, counts in bad.items():
+        if counts["ane"] or counts["gpu"] or counts["cpu"]:
+            lines.append(f"{fn}: {counts['ane']} ANE, {counts['gpu']} GPU, "
+                         f"{counts['cpu']} CPU")
+        else:
+            lines.append(f"{fn}: the compute plan attributed no device to any of "
+                         f"{counts['ops']} operations")
+        for op in counts["fallbacks"][:20]:
+            lines.append(f"  - {op}")
+    raise PlacementError(
+        f"{label} has operations off the Neural Engine (spec gate: every op on "
+        f"the ANE): " + "; ".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# The converter
+# ---------------------------------------------------------------------------
+
+class _ComponentModel(dam.DoryANEForCausalLM):
+    """DoryANEForCausalLM restricted to the blocks one component converts.
+
+    Inherits ticket DANE-4's weight loader unchanged -- the folding of the four
+    static scales (spec D5) happens exactly once, in that loader -- and changes
+    only which blocks exist, so converting the output block does not allocate
+    the recurrent block's 1.8 B parameters.  The cache buffers are built for the
+    full 36 slots regardless, which is what keeps the state union identical
+    across components.
+    """
+
+    def __init__(self, config, block_indices, load_lm_head: bool = False):
+        torch.nn.Module.__init__(self)
+        self.config = config
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size,
+                                               dtype=config.dtype)
+        self.model = dam.DoryANEModel(config, block_indices=list(block_indices))
+        self.load_lm_head = bool(load_lm_head)
+        if load_lm_head:
+            self.lm_head = torch.nn.Conv2d(config.hidden_size, config.vocab_size,
+                                           kernel_size=1, bias=False, dtype=config.dtype)
+            self.register_buffer("logit_scale", torch.empty(0), persistent=False)
+        else:
+            self.lm_head = None
+        self._active_loops = None
+
+
+class DoryConverter(BaseConverter):
+    """Convert Dory's five components to multifunction Core ML packages."""
+
+    def __init__(self, model_path, output_dir, config=None, prefix="dory",
+                 lut_blocks=6, lut_lm_head=6, lut_embeddings=None,
+                 lut_per_channel=8, lm_head_splits=8, recurrent_splits=1,
+                 argmax=False, check_placement=True, verbose=True):
+        super().__init__(model=None)
+        self.model_path = Path(model_path)
+        self.output_dir = Path(output_dir)
+        if config is None:
+            raise ValueError("a DoryANEConfig is required (DoryANEConfig() or "
+                             "DoryANEConfig.from_json(model_dir/config.json))")
+        self.config = config
+        self.prefix = prefix
+        self.lut_bits = {
+            "embeddings": _lut_value(lut_embeddings),
+            "blocks": _lut_value(lut_blocks),
+            "lm_head": _lut_value(lut_lm_head),
+        }
+        self.lut_per_channel = int(lut_per_channel)
+        self.lm_head_splits = int(lm_head_splits)
+        self.recurrent_splits = int(recurrent_splits)
+        self.argmax = bool(argmax)
+        self.check_placement_gate = bool(check_placement)
+        self.verbose = bool(verbose)
+        from anemll.models.dory_chunks import lm_head_split_sizes
+        self.lm_head_chunk_sizes = lm_head_split_sizes(self.config.vocab_size,
+                                                       self.lm_head_splits)
+        self.placement: dict = {}
+        self.sizes: dict = {}
+        self.seconds: dict = {}
+
+    # -- plan --------------------------------------------------------------
+    @property
+    def specs(self) -> list:
+        return component_specs(self.config, self.recurrent_splits)
+
+    def spec(self, name: str) -> ComponentSpec:
+        for spec in self.specs:
+            if spec.name == name:
+                return spec
+        raise KeyError(f"no component named {name}; known: {[s.name for s in self.specs]}")
+
+    def file_name(self, spec: ComponentSpec, function: str = None) -> str:
+        """Package name. One package per function: multifunction files are
+        rejected by this macOS build (see docs/dory.md), so infer and prefill
+        are separate files that each hold one function."""
+        lut = _lut_value(self.lut_bits.get(spec.lut_role))
+        suffix = f"_lut{lut}" if lut else ""
+        tail = f"_{function}" if function else ""
+        return f"{self.prefix}_{spec.name}{suffix}{tail}.mlpackage"
+
+    def estimates(self) -> list:
+        """(component, estimated bytes) for the whole conversion."""
+        out = []
+        for spec in self.specs:
+            bits = self.lut_bits.get(spec.lut_role)
+            out.append((spec, estimate_component_bytes(spec, self.config, bits)))
+        return out
+
+    def guard_sizes(self) -> dict:
+        """Refuse the whole run before converting anything that cannot fit."""
+        sizes = {}
+        for spec, size in self.estimates():
+            check_size(spec.name, size)
+            sizes[spec.name] = size
+        return sizes
+
+    # -- model construction ------------------------------------------------
+    def build_component(self, spec: ComponentSpec):
+        """The component's modules plus the traceable wrapper around them."""
+        indices = list(range(*spec.blocks)) if spec.kind == "blocks" else []
+        model = _ComponentModel(self.config, indices,
+                                load_lm_head=(spec.kind == "lm_head"))
+        model.load_pretrained_weights(str(self.model_path), blocks=indices,
+                                      load_lm_head=(spec.kind == "lm_head"))
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+        model.model.reset_caches()
+
+        if spec.kind == "embeddings":
+            wrapper = dch.EmbeddingChunk(self.config, model.embed_tokens, model.model)
+        elif spec.kind == "lm_head":
+            wrapper = dch.LMHeadChunk(self.config, model.lm_head.weight.data,
+                                      self.lm_head_splits, model.model,
+                                      argmax=self.argmax)
+            model.lm_head = None  # the weights are in the wrapper now
+        else:
+            wrapper = dch.BlockChunk(model.model, spec.blocks[0], spec.blocks[1],
+                                     loop_entry=spec.loop_entry,
+                                     loop_exit=spec.loop_exit)
+        wrapper.eval()
+        for param in wrapper.parameters():
+            param.requires_grad = False
+        return model, wrapper
+
+    # -- tracing / conversion ---------------------------------------------
+    def _example_inputs(self, spec: ComponentSpec, seq: int):
+        dtype = self.config.dtype
+        hidden = torch.zeros(1, seq, self.config.hidden_size, dtype=dtype)
+        if spec.kind == "embeddings":
+            # int32 end to end: torch's embedding accepts it (checked) and the
+            # Core ML input is declared int32, so there is no dtype cast to get
+            # wrong between the trace and the converted graph.
+            return (torch.zeros(1, seq, dtype=torch.int32),)
+        if spec.kind == "lm_head":
+            return (hidden,)
+        mask = torch.zeros(1, 1, seq, self.config.mask_len, dtype=dtype)
+        pos = torch.zeros(1, dtype=torch.int32)
+        cache_pos = torch.zeros(1, dtype=torch.int32)
+        args = [hidden, mask, pos, cache_pos]
+        if spec.loop_entry:
+            args.append(hidden.clone())
+        return tuple(args)
+
+    def _coreml_inputs(self, spec: ComponentSpec, seq: int) -> list:
+        dtype = self.config.dtype
+        hidden = (1, seq, self.config.hidden_size)
+        types = []
+        for name in spec.inputs:
+            if name == "input_ids":
+                types.append(ct.TensorType(name=name, shape=(1, seq), dtype=np.int32))
+            elif name == "causal_mask":
+                types.append(ct.TensorType(name=name, shape=(1, 1, seq, self.config.mask_len),
+                                           dtype=np.float16))
+            elif name in ("current_pos", "cache_pos"):
+                types.append(ct.TensorType(name=name, shape=(1,), dtype=np.int32))
+            else:
+                types.append(ct.TensorType(name=name, shape=hidden, dtype=np.float16))
+        return types
+
+    def _coreml_outputs(self, spec: ComponentSpec) -> list:
+        names = (self._lm_head_output_names() if spec.kind == "lm_head"
+                 else ["output_hidden_states" if spec.kind == "blocks" else "hidden_states"])
+        types = []
+        for name in names:
+            if name.startswith("argmax_idx"):
+                types.append(ct.TensorType(name=name, dtype=np.int32))
+            else:
+                types.append(ct.TensorType(name=name, dtype=np.float16))
+        return types
+
+    def _lm_head_output_names(self) -> list:
+        if self.argmax:
+            names = []
+            for i in range(1, self.lm_head_splits + 1):
+                names.extend([f"argmax_idx_{i}", f"argmax_val_{i}"])
+            return names
+        return [f"logits_{i}" for i in range(1, self.lm_head_splits + 1)]
+
+    def states(self, wrapper) -> list:
+        """The state list: both cache buffers, in a fixed order, for every component."""
+        states = []
+        for attr in dch.STATE_ATTRS:
+            buffer = getattr(wrapper.model, attr)
+            states.append(ct.StateType(
+                name=f"model.{attr}",
+                wrapped_type=ct.TensorType(shape=tuple(int(d) for d in buffer.shape),
+                                           dtype=np.float16)))
+        return states
+
+    @staticmethod
+    def _reset_caches(module):
+        with torch.no_grad():
+            for name, buffer in module.named_buffers():
+                if "kv_cache_" in name:
+                    buffer.zero_()
+
+    def trace(self, spec: ComponentSpec, wrapper, seq: int):
+        """Trace one function of one component (ANEMLL's discipline)."""
+        self._reset_caches(wrapper)
+        example = self._example_inputs(spec, seq)
+        with torch.no_grad():
+            traced = torch.jit.trace(wrapper, example, strict=False)
+        self._reset_caches(wrapper)
+        self._reset_caches(traced)
+        return traced
+
+    def convert_function(self, spec: ComponentSpec, wrapper, seq: int):
+        """Trace and convert one function; returns the unquantized MLModel."""
+        traced = self.trace(spec, wrapper, seq)
+        return ct.convert(
+            traced,
+            inputs=self._coreml_inputs(spec, seq),
+            outputs=self._coreml_outputs(spec),
+            states=self.states(wrapper),
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+
+    def palettize(self, model, bits, label: str):
+        """LUT-palettize weights after conversion; never silently skip it."""
+        if bits is None:
+            return model
+        from coremltools.optimize.coreml import palettize_weights
+
+        config = OptimizationConfig(global_config=OpPalettizerConfig(
+            mode="kmeans", nbits=int(bits), granularity="per_grouped_channel",
+            group_size=self.lut_per_channel, num_kmeans_workers=1))
+        try:
+            return palettize_weights(model, config)
+        except ValueError as exc:
+            if "Pool not running" not in str(exc):
+                raise
+            config.global_config.num_kmeans_workers = 1
+            return palettize_weights(model, config)
+
+    # -- one component end to end -----------------------------------------
+    def convert_component(self, name: str) -> dict:
+        """Convert one component: one package per function, sized and placement-gated."""
+        spec = self.spec(name)
+        bits = self.lut_bits.get(spec.lut_role)
+        check_size(spec.name, estimate_component_bytes(spec, self.config, bits))
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        started = time.time()
+        model, wrapper = self.build_component(spec)
+        emitted = {}
+        try:
+            for function, seq in self._functions(spec):
+                converted = self.convert_function(spec, wrapper, seq)
+                converted = self.palettize(converted, bits, f"{spec.name}/{function}")
+                out_path = self.output_dir / self.file_name(spec, function)
+                self._finalize_package(spec, function, converted, out_path)
+                size = self._dir_size(out_path)
+                check_size(f"{spec.name}/{function}", size)
+                emitted[function] = out_path
+                self.sizes[f"{spec.name}:{function}"] = size
+                if self.verbose:
+                    print(f"  {spec.name}/{function}: {out_path.name} "
+                          f"{size / 1024 ** 2:.0f} MB")
+        finally:
+            del wrapper
+            del model
+        for function, out_path in emitted.items():
+            self._gate_placement(spec, out_path, function)
+        self.seconds[spec.name] = time.time() - started
+        if self.verbose:
+            total = sum(self.sizes[f"{spec.name}:{fn}"] for fn in emitted) / 1024 ** 2
+            print(f"{spec.name}: {len(emitted)} packages, {total:.0f} MB total, "
+                  f"{self.seconds[spec.name]:.0f}s")
+        return emitted
+
+    def _package_metadata(self, spec: ComponentSpec, function: str) -> dict:
+        """The com.anemll.* metadata recorded inside one package."""
+        return {
+            "context_length": self.config.context_length,
+            "state_length": self.config.state_length,
+            "batch_size": self.config.batch_size,
+            "num_chunks": len(self.specs),
+            "lut_bits": _lut_value(self.lut_bits.get(spec.lut_role)),
+            "function_names": [function],
+            "vocab_size": self.config.vocab_size if spec.kind == "lm_head" else None,
+            "lm_head_chunk_sizes": (self.lm_head_chunk_sizes
+                                    if spec.kind == "lm_head" else None),
+            "argmax_in_model": bool(self.argmax) if spec.kind == "lm_head" else False,
+        }
+
+    def _finalize_package(self, spec: ComponentSpec, function: str, model,
+                          out_path: Path) -> None:
+        """Attach metadata to the in-memory model and save it.
+
+        No reload: the model that just came out of ct.convert + palettize is the
+        one to write, so the save never depends on a package being loadable.
+        """
+        AddMetadata(model, self._package_metadata(spec, function))
+        shutil.rmtree(out_path, ignore_errors=True)
+        model.save(str(out_path))
+
+    def _gate_placement(self, spec: ComponentSpec, out_path: Path,
+                        function: str = None) -> None:
+        """The spec's placement gate: refuse a package that is not all on the ANE."""
+        label = f"{spec.name}/{function}" if function else spec.name
+        if not self.check_placement_gate:
+            print(f"WARNING: placement gate skipped for {label}; the spec "
+                  f"requires every op on the Neural Engine", file=sys.stderr)
+            return
+        report = placement_report(out_path)
+        self.placement.setdefault(spec.name, {})[function or "main"] = report
+        assert_ane_only(report, f"{label} ({out_path.name})")
+
+    def _functions(self, spec: ComponentSpec) -> list:
+        """(function_name, sequence_length) pairs this component provides."""
+        pairs = [("infer", 1)]
+        if int(self.config.batch_size) > 1:
+            pairs.append(("prefill", int(self.config.batch_size)))
+        return pairs
+
+    def _unused_combine(self, spec: ComponentSpec, saved: list, out_path: Path) -> None:
+        """Retired: multifunction packages do not load on this OS (docs/dory.md)."""
+        sources = [(str(path), "main", function) for function, path in saved]
+        metadata = {
+            "context_length": self.config.context_length,
+            "state_length": self.config.state_length,
+            "batch_size": self.config.batch_size,
+            "num_chunks": len(self.specs),
+            "lut_bits": _lut_value(self.lut_bits.get(spec.lut_role)),
+            "function_names": [fn for fn, _ in saved],
+            "vocab_size": self.config.vocab_size if spec.kind == "lm_head" else None,
+            "lm_head_chunk_sizes": (self.lm_head_chunk_sizes
+                                    if spec.kind == "lm_head" else None),
+            "argmax_in_model": bool(self.argmax) if spec.kind == "lm_head" else False,
+        }
+        # Weld into a temp package, then load THAT and save to the real name.
+        # coremltools 8.3's save_multifunction() returns None (it only writes
+        # the package), and MLModel.save() deletes its destination before
+        # copying, so saving a package onto itself would delete the source.
+        temp_package = out_path.parent / (".combine_" + out_path.name)
+        shutil.rmtree(temp_package, ignore_errors=True)
+        shutil.rmtree(out_path, ignore_errors=True)
+        if len(sources) > 1:
+            with prepare_dedup_sources(sources) as deduped:
+                descriptor = ct.utils.MultiFunctionDescriptor()
+                for path, src, tgt in deduped:
+                    descriptor.add_function(path, src, tgt)
+                descriptor.default_function_name = sources[0][2]
+                ct.utils.save_multifunction(descriptor, str(temp_package))
+        else:
+            shutil.copytree(sources[0][0], temp_package)
+        combined = ct.models.MLModel(str(temp_package))
+        if combined is None:
+            raise RuntimeError(f"could not load the combined package {temp_package}")
+        AddMetadata(combined, metadata)
+        combined.save(str(out_path))
+        shutil.rmtree(temp_package, ignore_errors=True)
+
+    @staticmethod
+    def _dir_size(path: Path) -> int:
+        path = Path(path)
+        if path.is_file():
+            return path.stat().st_size
+        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+    # -- deliverables ------------------------------------------------------
+    def compiled_name(self, spec: ComponentSpec, function: str = None) -> str:
+        return self.file_name(spec, function)[: -len(".mlpackage")] + ".mlmodelc"
+
+    def compile_packages(self) -> dict:
+        """Compile every package to .mlmodelc (the cached form the runtime loads)."""
+        done = {}
+        for spec in self.specs:
+            for function, _ in self._functions(spec):
+                package = self.output_dir / self.file_name(spec, function)
+                if not package.exists():
+                    continue
+                started = time.time()
+                result = subprocess.run(
+                    ["xcrun", "coremlcompiler", "compile", str(package),
+                     str(self.output_dir)],
+                    capture_output=True, text=True)
+                key = f"{spec.name}:{function}"
+                if result.returncode != 0:
+                    raise RuntimeError(f"coremlcompiler failed for {package.name}: "
+                                       f"{result.stderr.strip()[:400]}")
+                done[key] = {"seconds": time.time() - started,
+                             "path": str(self.output_dir / self.compiled_name(spec, function))}
+                if self.verbose:
+                    print(f"compiled {self.compiled_name(spec, function)} "
+                          f"in {done[key]['seconds']:.1f}s")
+        return done
+
+    TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+                       "chat_template.jinja", "chat_template.json", "added_tokens.json",
+                       "special_tokens_map.json", "vocab.json", "merges.txt",
+                       "generation_config.json")
+
+    def copy_tokenizer(self) -> list:
+        """Copy the tokenizer and chat template next to the models (meta points at them).
+
+        A chat_template.jinja in the weights directory is copied; failing that,
+        a chat_template embedded in tokenizer_config.json is written out as one,
+        so the artifact always says how prompts were formatted (or the meta
+        records that it had to fall back -- see FALLBACK_TEMPLATE).
+        """
+        copied = []
+        for name in self.TOKENIZER_FILES:
+            source = self.model_path / name
+            if not source.is_file():
+                continue
+            target = self.output_dir / name
+            if source.resolve() == target.resolve():
+                copied.append(name)
+                continue
+            shutil.copy2(source, target)
+            copied.append(name)
+        template_path = self.output_dir / "chat_template.jinja"
+        if not template_path.is_file():
+            config_path = self.model_path / "tokenizer_config.json"
+            if config_path.is_file():
+                try:
+                    with open(config_path, "r", encoding="utf-8") as handle:
+                        raw = json.load(handle)
+                except (OSError, ValueError):
+                    raw = {}
+                template = raw.get("chat_template")
+                if isinstance(template, list) and template:
+                    template = template[0].get("template") if isinstance(template[0], dict) \
+                        else template[0]
+                if isinstance(template, str) and template.strip():
+                    template_path.write_text(template, encoding="utf-8")
+                    copied.append("chat_template.jinja")
+        return copied
+
+    def manifest_files(self) -> dict:
+        """Component -> {function: the file the runtime should load}.
+
+        The compiled form is preferred when it exists (it is the cached compile
+        the runtime benefits from); otherwise the package, which Core ML
+        compiles on first load.
+        """
+        files = {}
+        for spec in self.specs:
+            entry = {}
+            for function, _ in self._functions(spec):
+                compiled = self.output_dir / self.compiled_name(spec, function)
+                entry[function] = (self.compiled_name(spec, function) if compiled.exists()
+                                   else self.file_name(spec, function))
+            files[spec.name] = entry
+        return files
+
+    def write_artifacts(self) -> dict:
+        """Everything the runtime directory needs: tokenizer, config, meta, report."""
+        copied = self.copy_tokenizer()
+        source_config = self.model_path / "config.json"
+        if source_config.is_file():
+            shutil.copy2(source_config, self.output_dir / "config.json")
+        files = self.manifest_files()
+        meta = build_meta(
+            config=self.config, specs=self.specs, files=files,
+            lut_bits=self.lut_bits, lm_head_chunk_sizes=self.lm_head_chunk_sizes,
+            prefix=self.prefix, argmax=self.argmax,
+            tokenizer="tokenizer.json",
+            chat_template=("chat_template.jinja" if "chat_template.jinja" in copied
+                           else None))
+        yaml_path = write_meta(self.output_dir / "meta.yaml", meta)
+        report_path = self.write_report(meta, copied)
+        return {"meta": str(yaml_path), "report": str(report_path)}
+
+    def write_report(self, meta: dict, tokenizer_files: list) -> Path:
+        """conversion_report.json: sizes, timings and per-function placement."""
+        report = {
+            "components": {name: {
+                "bytes": {fn: self.sizes.get(f"{name}:{fn}") for fn in meta["components"][name]["files"]},
+                "seconds": self.seconds.get(name),
+                "placement": self.placement.get(name)} for name in meta["run_order"]},
+            "estimates": {spec.name: estimate_component_bytes(
+                spec, self.config, self.lut_bits.get(spec.lut_role))
+                for spec in self.specs},
+            "tokenizer_files": list(tokenizer_files),
+            "created": meta["model_info"]["created"],
+            "config": {
+                "context_length": self.config.context_length,
+                "batch_size": self.config.batch_size,
+                "lut": {role: _lut_value(bits) for role, bits in self.lut_bits.items()},
+                "lm_head_splits": self.lm_head_splits,
+                "recurrent_splits": self.recurrent_splits,
+            },
+        }
+        path = self.output_dir / "conversion_report.json"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+        return path
+
+    # -- the whole run -----------------------------------------------------
+    def convert(self, component="all"):
+        """BaseConverter entry point: 'all' or a component name."""
+        if component in ("all", None):
+            return self.run()
+        return self.convert_component(component)
+
+    def run(self, only=None, dry_run=False, do_compile=True) -> dict:
+        """Convert every component, compile, and write meta.yaml.
+
+        A dry run writes nothing at all: it prints the plan, the per-file size
+        guard's verdict and the disk check, and returns.
+        """
+        wanted = None if not only else {name.strip() for name in str(only).split(",")}
+        plan = [(spec, estimate_component_bytes(spec, self.config,
+                                                self.lut_bits.get(spec.lut_role)))
+                for spec in self.specs if wanted is None or spec.name in wanted]
+        if self.verbose:
+            print(f"Dory conversion plan ({len(plan)} components, context "
+                  f"{self.config.context_length}, batch {self.config.batch_size}):")
+            for spec, size in plan:
+                print(f"  {spec.name:14s} {size / 1024 ** 2:8.0f} MB estimated"
+                      f"  blocks={spec.blocks}  lut={self.lut_bits.get(spec.lut_role)}"
+                      f"  calls/token={spec.calls_per_token}")
+        for spec, size in plan:
+            check_size(spec.name, size)
+        disk = check_disk(nearest_existing(self.output_dir), plan)
+        if self.verbose:
+            print(f"disk: {disk['free'] / 1024 ** 3:.1f} GB free, "
+                  f"{disk['needed'] / 1024 ** 3:.1f} GB needed")
+        if dry_run:
+            return {"dry_run": True, "estimates": {s.name: n for s, n in plan},
+                    "disk": disk, "components": {s.name: n for s, n in plan}}
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        started = time.time()
+        for spec, _ in plan:
+            if self.verbose:
+                print(f"converting {spec.name} ...")
+            self.convert_component(spec.name)
+        compiled = self.compile_packages() if do_compile else {}
+        artifacts = self.write_artifacts()
+        total = time.time() - started
+        if self.verbose:
+            print(f"conversion finished in {total:.0f}s; meta at {artifacts['meta']}")
+        return {"components": {spec.name: self.sizes.get(spec.name) for spec, _ in plan},
+                "compiled": compiled, "seconds": total, **artifacts}
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_config(model_path, context_length=None, batch_size=None, config=None):
+    """DoryANEConfig from the model directory's config.json, with overrides."""
+    model_path = Path(model_path)
+    config_json = model_path / "config.json"
+    overrides = {}
+    if context_length is not None:
+        overrides["context_length"] = int(context_length)
+    if batch_size is not None:
+        overrides["batch_size"] = int(batch_size)
+    if config is not None:
+        return config
+    if config_json.is_file():
+        return dam.DoryANEConfig.from_json(str(config_json), **overrides)
+    return dam.DoryANEConfig(**overrides)
+
+
+def parse_args(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Convert Dory1.0-4B into the five multifunction Core ML chunks "
+                    "of spec D6 (embeddings, input, recurrent, output, split LM head).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--model", required=True, help="directory with the BF16 safetensors")
+    parser.add_argument("--output", required=True, help="output directory")
+    parser.add_argument("--prefix", default="dory", help="file-name prefix")
+    parser.add_argument("--context-length", type=int, default=1024,
+                        help="rows of a full-attention cache (tracer bullet: 1024)")
+    parser.add_argument("--batch-size", type=int, default=64, help="prefill batch size")
+    parser.add_argument("--lut-blocks", default="6", help="LUT bits for the block chunks (none to skip)")
+    parser.add_argument("--lut-lm-head", default="6", help="LUT bits for the LM head")
+    parser.add_argument("--lut-embeddings", default="none",
+                        help="LUT bits for the embeddings (spec D8: unquantized or 8)")
+    parser.add_argument("--lut-per-channel", type=int, default=8,
+                        help="per_grouped_channel group size")
+    parser.add_argument("--lm-head-splits", type=int, default=8,
+                        help="even LM-head parts (vocab 131072: 8 x 16384)")
+    parser.add_argument("--recurrent-splits", type=int, default=1,
+                        help="split the recurrent block into N files if it exceeds 2 GB")
+    parser.add_argument("--argmax", action="store_true",
+                        help="return local argmax indices from the LM head instead of logits")
+    parser.add_argument("--no-placement-check", action="store_true",
+                        help="skip the per-function ANE placement gate (never do this for a gate)")
+    parser.add_argument("--no-compile", action="store_true", help="skip the .mlmodelc step")
+    parser.add_argument("--only", default=None,
+                        help="comma-separated component names (default: all)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the plan and the size estimates, convert nothing")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    config = build_config(args.model, args.context_length, args.batch_size)
+    converter = DoryConverter(
+        model_path=args.model, output_dir=args.output, config=config, prefix=args.prefix,
+        lut_blocks=args.lut_blocks, lut_lm_head=args.lut_lm_head,
+        lut_embeddings=args.lut_embeddings, lut_per_channel=args.lut_per_channel,
+        lm_head_splits=args.lm_head_splits, recurrent_splits=args.recurrent_splits,
+        argmax=args.argmax, check_placement=not args.no_placement_check)
+    try:
+        result = converter.run(only=args.only, dry_run=args.dry_run,
+                               do_compile=not args.no_compile)
+    except ModelTooLargeError as exc:
+        print(f"stopped: {exc}", file=sys.stderr)
+        return 2
+    except PlacementError as exc:
+        print(f"placement gate failed: {exc}", file=sys.stderr)
+        return 3
+    if not args.dry_run:
+        print(json.dumps({"components": {k: v for k, v in result.get("components", {}).items()}},
+                         indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
