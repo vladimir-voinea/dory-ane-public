@@ -131,6 +131,37 @@ class _TorchBackend:
         pass
 
 
+def score_window(reference_path, candidate_path, start: int, end: int):
+    """Score the candidate against the reference rows [start, end).
+
+    A reference built as one full context covers a wide range (12,288..24,574 for
+    a 24,576-token text), while the gate names a window beyond 16K.  The scorer
+    insists that candidate and reference cover exactly the same rows, so the
+    reference is sliced to the window here -- KLD is per row, and a window of rows
+    is the measurement the gate asks for.
+    """
+    import numpy as np
+
+    from anemll.eval.kld import (array_source, read_candidate_npz, read_source,
+                                 score_sources)
+
+    reference = read_source(reference_path)
+    keep = np.where((reference.positions >= int(start))
+                    & (reference.positions < int(end)))[0]
+    if keep.size == 0:
+        raise ValueError(f"the reference has no rows in [{start}, {end})")
+    lo, hi = int(keep.min()), int(keep.max()) + 1
+    block = reference.logp_block(lo, hi)
+    if keep.size != hi - lo:
+        block = block[keep - lo]
+    sliced = array_source(block, tokens=reference.tokens,
+                          positions=reference.positions[keep],
+                          name=f"{Path(str(reference_path)).stem}[{start}:{end}]",
+                          meta=dict(getattr(reference, "meta", None) or {}))
+    candidate = read_candidate_npz(candidate_path)
+    return score_sources(sliced, candidate, direction="ref->cand")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Score decode-mode log-probabilities at absolute positions > 16K")
@@ -179,7 +210,7 @@ def main(argv=None) -> int:
     candidate = write_candidate(args.out, logprobs, positions, ids, payload)
     print(f"wrote {candidate}", file=sys.stderr)
     if args.reference:
-        result = score_files(args.reference, candidate)
+        result = score_window(args.reference, candidate, args.start, args.end)
         print(result.summary())
         print(json.dumps(result.as_dict(), indent=2))
     return 0
@@ -187,4 +218,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
