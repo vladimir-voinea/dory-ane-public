@@ -67,20 +67,131 @@ __all__ = [
 STATE_ATTRS = ("kv_cache_full", "kv_cache_sliding")
 
 
+def _caches():
+    """dory_caches, imported lazily.
+
+    This module deliberately imports nothing at module scope (the extracted
+    build loads it before its siblings exist), so the shape helpers are fetched
+    on first use instead of bound at import time.
+    """
+    from anemll.utils import dory_caches
+
+    return dory_caches
+
+
+def state_layout(config=None) -> tuple:
+    """Every state buffer as (name, shape), in declaration order.
+
+    Three axes decide the list, and only the first exists by default:
+
+      tiles  the tiled full-attention fallback (spec D7) splits the full cache
+             by context rows, one buffer per tile (DANE-6's path).
+      heads  the measured single-state ceiling on this host -- 24 MiB loads,
+             32 MiB fails, 3/3 attempts each -- splits each cache by key/value
+             head, so one buffer holds (2 slots, heads_per_state, rows, head_dim).
+      slots  the aggregate buffer interleaves K and V along dim 0: K at slot,
+             V at slot + num_slots, as dory_caches.write_cache_rows expects.
+
+    Default: no tiles, no head split -> exactly the two buffers this module
+    declared before, byte for byte, so nothing that exists today changes shape.
+    Tiles and head-splitting are mutually exclusive until the tiled path learns
+    the head axis: both at once would produce a list neither caller understands,
+    so asking for it raises instead of guessing.
+    """
+    tiles = getattr(config, "full_tiles", (1,)) if config is not None else (1,)
+    heads_per_state = getattr(config, "heads_per_state", None) if config is not None else None
+    if heads_per_state is None and config is not None:
+        heads_per_state = getattr(config, "cache_heads_per_state", None)
+    if heads_per_state is None:
+        if len(tiles) == 1:
+            full = [("kv_cache_full", _caches().cache_shapes(
+                config.context_length, config.num_key_value_heads, config.head_dim,
+                config.sliding_window, config.batch_size)[0])]
+        else:
+            shapes = _caches().full_cache_shapes(
+                config.context_length, config.num_key_value_heads, config.head_dim,
+                tiles, num_slots=len(_caches().cache_slots()[0]))
+            full = [(f"kv_cache_full_{index}", shape)
+                    for index, shape in enumerate(shapes, start=1)]
+        _, sliding_shape = _caches().cache_shapes(
+            config.context_length, config.num_key_value_heads, config.head_dim,
+            config.sliding_window, config.batch_size)
+        return tuple(full + [("kv_cache_sliding", sliding_shape)])
+
+    if len(tiles) > 1:
+        raise ValueError(
+            "the tiled full cache and the per-head cache split cannot be combined yet: "
+            "tiles split the full cache by context rows, heads split every cache by key "
+            "head, and a model needs one of them at a time until the tiled path carries "
+            "the head axis too.")
+
+    heads = int(heads_per_state)
+    num_heads = int(config.num_key_value_heads)
+    if heads < 1 or num_heads % heads:
+        raise ValueError(f"cache_heads_per_state must divide {num_heads} heads, got {heads}")
+    full_slots, sliding_slots = _caches().cache_slots()
+    full_rows = _caches().full_cache_rows(config.context_length)
+    sliding_rows = _caches().sliding_cache_rows(config.context_length, config.sliding_window,
+                                         config.batch_size)
+    head_dim = int(config.head_dim)
+    layout = []
+    for slot in range(len(full_slots)):
+        for head in range(0, num_heads, heads):
+            layout.append((f"kv_cache_full_{slot}_{head}",
+                           (2, heads, full_rows, head_dim)))
+    # The sliding cache is windowed, so its carriers are grouped by SLOT, not by
+    # head: one carrier holds a whole layer's K and V for every head (4 heads x
+    # 1,280 rows = 5.0 MiB per slot at 24K), and the group size is the largest
+    # divisor of the slot count whose carrier still fits under the measured
+    # per-state ceiling -- 27 slots become 9 carriers of 15.0 MiB rather than 27
+    # carriers of 5.0 MiB, because the state COUNT has its own ceiling (56 loads,
+    # 63 fails) and 36 full + 27 sliding = 63 would sit exactly on the failure.
+    slots_total = len(sliding_slots)
+    group = int(getattr(config, "slots_per_sliding_carrier", 3))
+    if group < 1 or slots_total % group:
+        raise ValueError(
+            f"slots_per_sliding_carrier must be a positive divisor of {slots_total} "
+            f"(the number of sliding layer-slots), got {group}.  Each carrier holds "
+            f"K and V of {group} layer(s); the per-state ceiling (24 MiB loads, 32 MiB "
+            f"fails) caps a carrier at "
+            f"{int(24.0 // (2 * sliding_rows * head_dim * num_heads * 2 / 1024 ** 2))} "
+            f"layer(s) at this context length.")
+    for start in range(0, slots_total, group):
+        count = min(group, slots_total - start)
+        layout.append((f"kv_cache_sliding_{start}_{start + count - 1}",
+                       (2 * count, num_heads, sliding_rows, head_dim)))
+    return tuple(layout)
+
+
 def state_attrs(config=None) -> tuple:
     """Every state buffer a component declares, in declaration order.
 
-    The tiled full-attention fallback (spec D7) turns the one full cache into
-    one buffer per tile, so the union of states is derived from the config
-    rather than hard-coded -- the converter, the runtime's single MLState and
-    every component must agree on the list or Core ML refuses the shared state.
+    The union is derived from the config rather than hard-coded: the converter,
+    the runtime's single MLState and every component must agree on the list or
+    Core ML refuses the shared state.  See state_layout for the axes.
     """
-    tiles = getattr(config, "full_tiles", (1,)) if config is not None else (1,)
-    if len(tiles) == 1:
-        full = ["kv_cache_full"]
-    else:
-        full = [f"kv_cache_full_{index}" for index in range(1, len(tiles) + 1)]
-    return tuple(full + ["kv_cache_sliding"])
+    return tuple(name for name, _ in state_layout(config))
+
+
+def state_summary(config=None) -> str:
+    """One line for the conversion report and the meta: sizes and the ceiling.
+
+    Anyone who later sees a -14 on this model should find these numbers next to
+    the artifact rather than re-deriving them from shapes.
+    """
+    layout = state_layout(config)
+    mib = [(name, shape) for name, shape in layout]
+    sizes = []
+    for _, shape in mib:
+        elements = 1
+        for dim in shape:
+            elements *= int(dim)
+        sizes.append(elements * 2 / 1024 ** 2)
+    total = sum(sizes)
+    largest = max(sizes) if sizes else 0.0
+    return ("%d states, %.1f MiB each for the largest group, %.1f MiB total, "
+            "max single state %.1f MiB (limit measured at 24 OK / 32 FAIL)"
+            % (len(layout), sizes[0] if sizes else 0.0, total, largest))
 
 
 def state_names(config=None, prefix: str = "model") -> tuple:
