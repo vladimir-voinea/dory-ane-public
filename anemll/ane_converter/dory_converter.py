@@ -692,7 +692,8 @@ class DoryConverter(BaseConverter):
     def __init__(self, model_path, output_dir, config=None, prefix="dory",
                  lut_blocks=6, lut_lm_head=6, lut_embeddings=None,
                  lut_per_channel=8, lm_head_splits=8, recurrent_splits=1,
-                 argmax=False, check_placement=True, verbose=True):
+                 argmax=False, check_placement=True, verbose=True,
+                 resume=False):
         super().__init__(model=None)
         self.model_path = Path(model_path)
         self.output_dir = Path(output_dir)
@@ -712,6 +713,9 @@ class DoryConverter(BaseConverter):
         self.argmax = bool(argmax)
         self.check_placement_gate = bool(check_placement)
         self.verbose = bool(verbose)
+        #: skip a function whose package already exists and verifies, so an
+        #: interrupted run resumes at the pass it was killed in
+        self.resume = bool(resume)
         from anemll.models.dory_chunks import lm_head_split_sizes
         self.lm_head_chunk_sizes = lm_head_split_sizes(self.config.vocab_size,
                                                        self.lm_head_splits)
@@ -723,6 +727,35 @@ class DoryConverter(BaseConverter):
     @property
     def specs(self) -> list:
         return component_specs(self.config, self.recurrent_splits)
+
+    def _finished_package(self, spec: ComponentSpec, function: str):
+        """Bytes of an existing package that still verifies, or None.
+
+        Component conversion is two ~25-minute palettize passes; when a run is
+        interrupted between them, redoing the finished one wastes the window.
+        A package counts as finished only when it loads, matches the size
+        prediction within 15 %, holds a single function and records the
+        function its name claims.
+        """
+        from coremltools.models.utils import load_spec
+
+        package = self.output_dir / self.file_name(spec, function)
+        if not package.is_dir():
+            return None
+        try:
+            spec_proto = load_spec(str(package))
+        except Exception:
+            return None
+        bits = self.lut_bits.get(spec.lut_role)
+        predicted = estimate_component_bytes(spec, self.config, bits)
+        size = self._dir_size(package)
+        if predicted and abs(size - predicted) > 0.15 * predicted:
+            return None
+        if len(list(spec_proto.description.functions)) > 1:
+            return None
+        recorded = str(spec_proto.description.metadata.userDefined.get(
+            "com.anemll.functions", ""))
+        return size if recorded == function else None
 
     def spec(self, name: str) -> ComponentSpec:
         for spec in self.specs:
@@ -909,6 +942,14 @@ class DoryConverter(BaseConverter):
         emitted = {}
         try:
             for function, seq in self._functions(spec):
+                if self.resume:
+                    done = self._finished_package(spec, function)
+                    if done is not None:
+                        print(f"  {spec.name}/{function}: already built "
+                              f"({done / 1024 ** 2:.0f} MB), skipped")
+                        self.sizes[f"{spec.name}:{function}"] = done
+                        emitted[function] = self.output_dir / self.file_name(spec, function)
+                        continue
                 converted = self.convert_function(spec, wrapper, seq)
                 converted = self.palettize(converted, bits, f"{spec.name}/{function}")
                 out_path = self.output_dir / self.file_name(spec, function)
