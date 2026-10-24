@@ -84,6 +84,12 @@ class DoryANEConfig:
         self.batch_size = g("batch_size", 64)
         self.fold_scales = g("fold_scales", True)
         self.compute_mode = g("compute_mode", "conv")
+        # Spec D6: the LM head is split so no single output axis is large.
+        # 8 x 16,384 is the ANE/converter packaging (ANEMLL's split_lm_head);
+        # MPS additionally refuses > 65,536 output channels outright, so the
+        # MPS evaluation path uses 16 x 8,192.  The concatenation order is the
+        # same either way, so the math does not depend on the count.
+        self.lm_head_parts = g("lm_head_parts", 8)
         self.dtype = g("dtype", MODEL_DTYPE)
         self.tie_word_embeddings = False
 
@@ -534,8 +540,15 @@ class DoryANEForCausalLM(nn.Module):
             self.model, config.input_layer_count + config.recurrent_layer_count,
             config.num_hidden_layers)
         self.load_lm_head = load_lm_head
+        self.lm_head_parts = int(config.lm_head_parts)
+        if self.lm_head_parts < 1 or config.vocab_size % self.lm_head_parts:
+            raise ValueError(f"vocab_size {config.vocab_size} is not divisible by "
+                             f"lm_head_parts {self.lm_head_parts}")
         if load_lm_head:
-            self.lm_head = _conv1x1(config.hidden_size, config.vocab_size, dt, config.compute_mode)
+            part = config.vocab_size // self.lm_head_parts
+            self.lm_head = nn.ModuleList([
+                _conv1x1(config.hidden_size, part, dt, config.compute_mode)
+                for _ in range(self.lm_head_parts)])
             self.register_buffer("logit_scale", torch.empty(0))
         else:
             self.lm_head = None
@@ -562,11 +575,15 @@ class DoryANEForCausalLM(nn.Module):
         self.model.reset_caches()
         self._active_loops = None
 
-    # -- masks ------------------------------------------------------------
+    # -- device / masks ---------------------------------------------------
+    @property
+    def device(self) -> torch.device:
+        return self.embed_tokens.weight.device
+
     def build_mask(self, start: int, q_len: int) -> torch.Tensor:
         return dc.build_causal_mask(start, q_len, self.config.context_length,
                                     self.config.sliding_rows, self.config.sliding_window,
-                                    dtype=self.config.dtype)
+                                    dtype=self.config.dtype).to(self.device)
 
     # -- forward paths ----------------------------------------------------
     @torch.inference_mode()
@@ -579,10 +596,13 @@ class DoryANEForCausalLM(nn.Module):
         for the decode-mode prefill path.
         """
         loops = self._resolve_loops(loops)
-        input_ids = torch.as_tensor(input_ids, dtype=torch.long).view(1, -1)
+        input_ids = torch.as_tensor(input_ids, dtype=torch.long,
+                                    device=self.device).view(1, -1)
         q_len = input_ids.shape[1]
-        cur = torch.tensor([start_pos], dtype=torch.int32)
-        cache_pos = torch.tensor([start_pos % self.config.sliding_rows], dtype=torch.int32)
+        # host-side paths pass positions as ints; the traced chunk takes them as
+        # int32 inputs (both slice the same way)
+        cur = int(start_pos)
+        cache_pos = int(start_pos) % self.config.sliding_rows
         mask = self.build_mask(start_pos, q_len)
         h = self.embed_tokens(input_ids)
         h = self.chunk_input(h, mask, cur, cache_pos)
@@ -596,10 +616,10 @@ class DoryANEForCausalLM(nn.Module):
     def decode_step(self, token_id: int, pos: int, loops: Optional[int] = None):
         """One token at pos; returns logits for the next token."""
         loops = self._resolve_loops(loops)
-        cur = torch.tensor([pos], dtype=torch.int32)
-        cache_pos = torch.tensor([pos % self.config.sliding_rows], dtype=torch.int32)
+        cur = int(pos)
+        cache_pos = int(pos) % self.config.sliding_rows
         mask = self.build_mask(pos, 1)
-        ids = torch.tensor([[int(token_id)]], dtype=torch.long)
+        ids = torch.tensor([[int(token_id)]], dtype=torch.long, device=self.device)
         h = self.embed_tokens(ids)
         h = self.chunk_input(h, mask, cur, cache_pos)
         h_in = h
@@ -609,9 +629,20 @@ class DoryANEForCausalLM(nn.Module):
         return self.logits(h)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Logits over the whole vocabulary, from the split head parts.
+
+        The split is part of the shipped design (spec D6: one ANE axis <= 65,536),
+        not just an evaluation workaround: each part is its own 1x1 convolution and
+        the runtime concatenates the parts in order, exactly like ANEMLL's
+        `split_lm_head` / `logits1..logitsN`.
+        """
         if self.lm_head is None:
             raise RuntimeError("model built without an lm_head")
-        out = _from_conv_layout(self.lm_head(_to_conv_layout(hidden_states)))
+        x = _to_conv_layout(hidden_states)
+        if isinstance(self.lm_head, nn.ModuleList):
+            out = torch.cat([_from_conv_layout(part(x)) for part in self.lm_head], dim=-1)
+        else:
+            out = _from_conv_layout(self.lm_head(x))
         if self.logit_scale.numel():
             out = out * self.logit_scale.view(1, 1, -1).to(out.dtype)
         return out.float()
@@ -655,8 +686,13 @@ class DoryANEForCausalLM(nn.Module):
                     W = _row_scale(W, logit_scale / float(cfg.init_std))
                 else:
                     self.logit_scale.data = (logit_scale / float(cfg.init_std)).to(cfg.dtype)
-                self.lm_head.weight.data.copy_(
-                    W.view(cfg.vocab_size, cfg.hidden_size, 1, 1).to(cfg.dtype))
+                W = W.view(cfg.vocab_size, cfg.hidden_size, 1, 1).to(cfg.dtype)
+                if isinstance(self.lm_head, nn.ModuleList):
+                    for part, chunk in zip(self.lm_head, W.split(
+                            cfg.vocab_size // self.lm_head_parts, dim=0)):
+                        part.weight.data.copy_(chunk)
+                else:
+                    self.lm_head.weight.data.copy_(W)
 
             for layer in self.model.layers:
                 p = layer.block

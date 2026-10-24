@@ -51,7 +51,8 @@ DEFAULT_WEIGHTS = os.path.expanduser(
 
 
 def log_softmax(logits: torch.Tensor) -> np.ndarray:
-    return torch.log_softmax(logits.float(), dim=-1).numpy()
+    # logits may live on Metal; numpy() needs a host copy first
+    return torch.log_softmax(logits.float().to("cpu"), dim=-1).numpy()
 
 
 def run_candidate(model, ids, first_scored, rows, mode, batch_size):

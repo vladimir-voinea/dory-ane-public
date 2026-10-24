@@ -629,3 +629,17 @@ def test_loop_count_outside_1_to_4_is_refused(tiny_model):
     for bad in (0, 5):
         with pytest.raises(ValueError):
             tiny_model.set_loops(bad)
+
+@pytest.mark.parametrize("parts", [1, 4, 8, 16])
+def test_split_lm_head_matches_a_single_head(tmp_path, tiny_weights, parts):
+    """Spec D6: N head parts concatenate to the single-head result, for any N."""
+    split = _build_model(tmp_path, tiny_weights, fold_scales=True, lm_head_parts=parts)
+    single = dm.DoryANEForCausalLM(dm.DoryANEConfig(
+        **{**TINY, "fold_scales": True, "lm_head_parts": 1}))
+    path = str(tmp_path / "tiny.safetensors")
+    _write_safetensors(path, tiny_weights)
+    single.load_pretrained_weights(path)
+    ids = [3, 5, 7, 11]
+    a = split.prefill(ids, 0, loops=2).detach()
+    b = single.prefill(ids, 0, loops=2).detach()
+    assert torch.allclose(a, b, rtol=1e-4, atol=1e-4), (a - b).abs().max().item()

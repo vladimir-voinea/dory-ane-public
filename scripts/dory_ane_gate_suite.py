@@ -155,6 +155,10 @@ def main(argv=None):
     ap.add_argument("--window-rows", type=int, default=256)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--lm-head-parts", type=int, default=8,
+                    help="spec D6 packaging; MPS needs >= 4 (65,536-channel cap)")
+    ap.add_argument("--device", default="cpu", choices=("cpu", "mps"),
+                    help="mps runs the same module through Metal; CPU dispatch still applies")
     ap.add_argument("--gates", default="prefill2,prefill1,prefill4,decode2,decode1,decode4")
     ap.add_argument("--out-json", default=os.path.join(ARTIFACTS, "gate_suite.json"))
     ap.add_argument("--save-candidates", action="store_true",
@@ -169,10 +173,14 @@ def main(argv=None):
     rows_spec = gate_rows(args.rows_mode, args.window_rows)
 
     cfg = DoryANEConfig(context_length=evalset.chunk_size, batch_size=args.batch,
-                        fold_scales=True, dtype=torch.float16, compute_mode="matmul")
+                        fold_scales=True, dtype=torch.float16,
+                        compute_mode="matmul" if args.device == "cpu" else "conv",
+                        lm_head_parts=args.lm_head_parts)
     model = DoryANEForCausalLM(cfg)
     t0 = time.time()
     report = model.load_pretrained_weights(args.weights)
+    if args.device != "cpu":
+        model = model.to(torch.device(args.device))
     print(f"[{time.strftime('%H:%M:%S')}] loaded {report['consumed']} tensors in "
           f"{time.time() - t0:.0f}s; loadavg={loadavg():.0f}", flush=True)
 
@@ -198,6 +206,7 @@ def main(argv=None):
             lp, pos = part["logprobs"], part["positions"]
             n = int(pos.size)
             entry = {"gate": name, "kind": kind, "loops": loops, "rows": n,
+                 "device": args.device, "lm_head_parts": args.lm_head_parts,
                      "chunk": part["chunk"],
                      "row_range": f"{int(pos[0])}..{int(pos[-1])}",
                      "wall_s": round(part["wall_s"], 1),
