@@ -49,6 +49,10 @@ __all__ = [
 MODEL_DTYPE = torch.float16
 
 
+def q_len_of(hidden_states) -> int:
+    return int(hidden_states.shape[1])
+
+
 def _as_list(value):
     """One cache or mask, or the list a tiled attention passes."""
     if isinstance(value, (list, tuple)):
@@ -93,6 +97,12 @@ class DoryANEConfig:
         # untiled cache; the two-tile layout is what a 24,576-row state falls
         # back to when it does not stay on the ANE.
         self.full_cache_tiles = g("full_cache_tiles", None)
+        # Spec D7 at 24K: the cos/sin tables of 24,577 rows are ~100 MB per
+        # package as graph constants (600 MB in the 40-block chunk, against the
+        # 2 GB file limit) and a dynamic slice of a constant is a placement
+        # risk, so the runtime can hand the rows in as inputs instead.  Off by
+        # default: the 4096 graph stays exactly what DANE-5 builds.
+        self.rope_tables_as_inputs = g("rope_tables_as_inputs", False)
 
         self.state_length = g("state_length", self.context_length)
         self.batch_size = g("batch_size", 64)
@@ -227,6 +237,23 @@ class DoryANERotaryEmbedding(nn.Module):
         half = x.shape[-1] // 2
         return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
+    def table_rows(self, start, q_len: int):
+        """The cos/sin rows of this batch, shaped like a graph input.
+
+        (1, 1, q_len, head_dim) each, exactly what the graph would have sliced
+        from its own constant table -- the host computes them instead when
+        rope_tables_as_inputs is on.
+        """
+        q_len = int(q_len)
+        begin = int(start)
+        cos = self.cos_cached[begin:begin + q_len].view(1, 1, q_len, self.head_dim)
+        sin = self.sin_cached[begin:begin + q_len].view(1, 1, q_len, self.head_dim)
+        return cos, sin
+
+    def apply_table(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """RoPE with cos/sin passed in rather than read from the constant table."""
+        return (x * cos) + (self.rotate_half(x) * sin)
+
     def forward(self, x: torch.Tensor, start, q_len: int) -> torch.Tensor:
         cos = self.cos_cached[start:start + q_len].view(1, 1, q_len, self.head_dim)
         sin = self.sin_cached[start:start + q_len].view(1, 1, q_len, self.head_dim)
@@ -344,7 +371,7 @@ class DoryANEAttention(nn.Module):
         return tuple(zip(self.tile_offsets, self.tile_rows))
 
     def forward(self, hidden_states, masks, caches, slot, num_slots, current_pos, cache_pos,
-                write_indices=None, write_gates=None):
+                write_indices=None, write_gates=None, rope_tables=None):
         """Attention over one cache, or over the spec's two full-attention tiles.
 
         masks / caches are lists: one entry per full-attention tile for a full
@@ -374,8 +401,13 @@ class DoryANEAttention(nn.Module):
         k = k.view(bsz, q_len, kv, d).transpose(1, 2)               # (B, KV, Q, D)
         v = v.view(bsz, q_len, kv, d).transpose(1, 2)
 
-        q = self.rope(q, current_pos, q_len)
-        k = self.rope(k, current_pos, q_len)
+        if rope_tables is None:
+            q = self.rope(q, current_pos, q_len)
+            k = self.rope(k, current_pos, q_len)
+        else:
+            cos, sin = rope_tables
+            q = self.rope.apply_table(q, cos, sin)
+            k = self.rope.apply_table(k, cos, sin)
 
         q = self.q_norm(q) * self.sq.view(1, h, 1, d)               # L2 then sqk
         k = self.k_norm(k)
@@ -512,17 +544,19 @@ class DoryANEDecoderLayer(nn.Module):
         return (residual_alpha.detach().to(torch.float32) * ka).abs()
 
     def forward(self, hidden_states, mask_full, mask_sliding, cache_full, cache_sliding,
-                current_pos, cache_pos, write_indices=None, write_gates=None):
+                current_pos, cache_pos, write_indices=None, write_gates=None,
+                rope_sliding=None, rope_full=None):
         residual = hidden_states
         if self.is_mlp:
             block_out = self.mixer(hidden_states)
         elif self.is_full:
             block_out = self.mixer(hidden_states, _as_list(mask_full), _as_list(cache_full),
                                    self.slot, self.num_slots, current_pos, cache_pos,
-                                   write_indices, write_gates)
+                                   write_indices, write_gates, rope_full)
         else:
             block_out = self.mixer(hidden_states, [mask_sliding], [cache_sliding],
-                                   self.slot, self.num_slots, current_pos, cache_pos)
+                                   self.slot, self.num_slots, current_pos, cache_pos,
+                                   None, None, rope_sliding)
         alpha = self.alpha.to(hidden_states.dtype).view(1, 1, -1)
         a = self.norm_in(residual)
         b = self.norm_out(block_out)
@@ -636,7 +670,8 @@ class DoryANEChunk(nn.Module):
 
     def forward(self, hidden_states, causal_mask, current_pos, cache_pos, h_in=None,
                 write_index_1=None, write_gate_1=None,
-                write_index_2=None, write_gate_2=None):
+                write_index_2=None, write_gate_2=None,
+                cos_sliding=None, sin_sliding=None, cos_full=None, sin_full=None):
         """One block range.  The extra inputs exist only for a tiled full cache.
 
         A traced graph cannot branch on the position, so a tiled conversion
@@ -655,6 +690,19 @@ class DoryANEChunk(nn.Module):
             if write_index_2 is not None:
                 write_indices.append(write_index_2)
                 write_gates.append(write_gate_2)
+        rope_sliding = rope_full = None
+        if model.config.rope_tables_as_inputs:
+            if cos_sliding is None:
+                # eager use: the same rows the graph would have sliced itself
+                attn = next(layer.mixer for layer in model.layers[self._indices[0]:]
+                            if not layer.is_mlp and not layer.is_full)
+                cos_sliding, sin_sliding = attn.rope.table_rows(current_pos, q_len_of(hidden_states))
+            if cos_full is None:
+                attn = next(layer.mixer for layer in model.layers[self._indices[0]:]
+                            if not layer.is_mlp and layer.is_full)
+                cos_full, sin_full = attn.rope.table_rows(current_pos, q_len_of(hidden_states))
+            rope_sliding = (cos_sliding, sin_sliding)
+            rope_full = (cos_full, sin_full)
         h = hidden_states
         if self.loop_entry:
             if h_in is None:
@@ -662,7 +710,8 @@ class DoryANEChunk(nn.Module):
             h = model.l2(h + h_in)
         for i in self._indices:
             h = model.layers[i](h, masks_full, mask_sliding, caches, model.kv_cache_sliding,
-                                current_pos, cache_pos, write_indices, write_gates)
+                                current_pos, cache_pos, write_indices, write_gates,
+                                rope_sliding, rope_full)
         if self.loop_exit:
             h = model.l2(h)
         return h
