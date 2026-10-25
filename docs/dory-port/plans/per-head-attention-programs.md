@@ -48,3 +48,33 @@ total — but both change the model's numerics, so they need the KLD gate behind
 * Per-(layer, head) numerics: the refactor in `ticket/DANE-5` is bit-identical to the
   aggregated layout at 4,096 and equal at 24,576, so splitting by head changes nothing in
   the math — only the packaging.
+
+## Measured dispatch cost (the number that decides TPS)
+
+One predict on a 24K per-head attention program — state (2,1,24576,256), real q·Kᵀ + mask +
+softmax + probs·V — costs **1.167 ms** (20 iterations, warmed, CPU_AND_NE).
+
+That single number prices the whole design:
+
+* 36 full-attention programs per loop pass => **42 ms**; at two loop passes **84 ms**.
+* Adding the sliding and MLP dispatches, one token at 24,576 tokens is **~90-120 ms**,
+  i.e. **8-12 tok/s**, and that is with the model already converted and correct.
+
+So **24K and high TPS are in direct conflict on this stack.** The work per token at 24K is
+not the problem — 248 MB of cache read per loop pass is ~2.5 ms of bandwidth — the problem is
+that the cache has to be spread across dozens of programs, and each program costs about a
+millisecond of latency that does not shrink with its size.
+
+Levers, in order of expected effect, all of which change either the model or the numerics:
+
+1. **int8 cache** — halves every cache, so two heads fit per program: 18 programs, ~21 ms per
+   loop pass, and roughly double the throughput. Needs the KLD gate to price the quality cost.
+2. **One loop pass at long context** — halves the dispatch count outright; Dory's loop count is
+   a runtime choice, and the KLD penalty of 2 loops -> 1 loop is measurable with the existing
+   reference (loops-1 floors are already recorded).
+3. **Shorter context** — at 8,192 a per-head cache is 8 MiB, so four heads fit per program:
+   9 programs instead of 36, and ~4x the throughput.
+
+What this rules out is the thing worth ruling out: a single-program or few-program 24K design.
+The state budget forbids it, and no packaging trick changes that.
+
