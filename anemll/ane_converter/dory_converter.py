@@ -381,33 +381,27 @@ def _state_descriptions(config) -> list:
     hard-coded pair here was exactly what made a tiled spec unconvertible.
     """
     tiles = tuple(getattr(config, "full_tiles", (1,)) or (1,))
-    full_shapes = dc.full_cache_shapes(
-        config.context_length, config.num_key_value_heads, config.head_dim,
-        tiles, num_slots=config.num_full_caches)
-    _, sliding_shape = dc.cache_shapes(
-        config.context_length, config.num_key_value_heads, config.head_dim,
-        config.sliding_window, config.batch_size)
     names = dch.state_names(config)
-    attrs = dch.state_attrs(config)
-    shapes = list(full_shapes) + [sliding_shape]
-    kinds = ["full"] * len(full_shapes) + ["sliding"]
     out = []
-    for index, (attr, name, shape, kind) in enumerate(zip(attrs, names, shapes, kinds)):
+    tiles_seen = 0
+    for (attr, shape), name in zip(dch.state_layout(config), names):
+        kind = "full" if attr.startswith("kv_cache_full") else "sliding"
         elements = int(np.prod(shape))
         entry = {
             "name": name,
             "buffer": attr,
             "kind": kind,
-            "slots": int(config.num_full_caches if kind == "full"
-                         else config.num_sliding_caches),
+            # K and V of every layer-slot in this buffer, interleaved along dim 0
+            "slots": int(shape[0]) // 2,
             "shape": [int(d) for d in shape],
             "rows": int(shape[2]),
             "dtype": "float16",
             "bytes": elements * 2,
         }
-        if kind == "full" and len(full_shapes) > 1:
-            entry["tile"] = index + 1
-            entry["tile_offset"] = int(sum(int(r) for r in tiles[:index]))
+        if kind == "full" and len(tiles) > 1:
+            entry["tile"] = tiles_seen + 1
+            entry["tile_offset"] = int(sum(int(r) for r in tiles[:tiles_seen]))
+            tiles_seen += 1
         out.append(entry)
     return out
 
@@ -516,6 +510,16 @@ def build_meta(*, config, specs, files, lut_bits, lm_head_chunk_sizes, prefix="d
             "write_scheme": "ring",
             "invalidate_on_loop_change": True,
             "tiled": bool(tiling_flags(config)[0]),
+            # DANE-5: how the caches are carved up, so a reader of the artifact
+            # can tell 45 states of 24.0 MiB from the aggregated pair without
+            # rebuilding the shapes.  state_layout describes both.
+            "heads_per_state": getattr(config, "heads_per_state", None),
+            "slots_per_sliding_carrier": int(
+                getattr(config, "slots_per_sliding_carrier", 3) or 3),
+            "state_layout": (
+                "per_head" if getattr(config, "heads_per_state", None) is not None
+                else "aggregated"),
+            "state_summary": dch.state_summary(config),
             "write_frame": ("one full-attention tile per call: the host passes "
                             "write_index_i / write_gate_i for every tile"
                             if tiling_flags(config)[0] else
@@ -583,31 +587,75 @@ def validate_meta(meta) -> list:
     states = kv.get("states") or []
     tiles = params.get("full_cache_tiles") or ([context] if isinstance(context, int) else [1])
     tiled = bool(params.get("full_cache_tiled", len(tiles) > 1))
-    n_full = len(tiles) if tiled else 1
-    need(len(states) == n_full + 1,
-         f"kv.states must declare one buffer per full-attention tile plus the sliding "
-         f"cache ({n_full + 1} with {n_full} tile(s)), got {len(states)}")
+    heads_per_state = kv.get("heads_per_state")
+    split = heads_per_state is not None
     need(bool(kv.get("tiled", tiled)) == tiled,
          f"kv.tiled ({kv.get('tiled')}) disagrees with parameters.full_cache_tiled ({tiled})")
+    need(not (tiled and split),
+         "kv.heads_per_state and the tiled fallback cannot be combined: the layout refuses "
+         "it, and a meta claiming both would describe a model nobody built")
     full_states = [state for state in states if state.get("kind") == "full"]
     sliding_states = [state for state in states if state.get("kind") == "sliding"]
-    need(len(full_states) == n_full,
-         f"kv.states declares {len(full_states)} full-attention buffers, expected {n_full}")
-    need(len(sliding_states) == 1,
-         f"kv.states declares {len(sliding_states)} sliding buffers, expected 1")
+    need(bool(full_states), "kv.states declares no full-attention buffers")
+    need(bool(sliding_states), "kv.states declares no sliding buffers")
+    if split:
+        # one state per (layer-slot, head group), and the windowed caches grouped
+        # by layer-slot -- the DANE-5 layout that stays under the per-state
+        # ceiling at 24,576 rows
+        num_kv = params.get("num_key_value_heads")
+        n_full_slots = params.get("num_full_caches")
+        n_sliding_slots = params.get("num_sliding_caches")
+        group = kv.get("slots_per_sliding_carrier")
+        usable = (isinstance(heads_per_state, int) and heads_per_state >= 1
+                  and isinstance(num_kv, int) and num_kv % heads_per_state == 0)
+        need(usable,
+             f"kv.heads_per_state ({heads_per_state!r}) must divide "
+             f"parameters.num_key_value_heads ({num_kv!r})")
+        if usable and isinstance(n_full_slots, int):
+            expected = int(n_full_slots) * (int(num_kv) // int(heads_per_state))
+            need(len(full_states) == expected,
+                 f"kv.states declares {len(full_states)} full-attention buffers, expected "
+                 f"{expected}: one per (layer-slot, head group) with {heads_per_state} "
+                 f"head(s) of {num_kv}")
+        need(isinstance(group, int) and group >= 1,
+             f"kv.slots_per_sliding_carrier must be a positive int, got {group!r}")
+        if isinstance(group, int) and group >= 1 and isinstance(n_sliding_slots, int):
+            expected = -(-int(n_sliding_slots) // int(group))
+            need(len(sliding_states) == expected,
+                 f"kv.states declares {len(sliding_states)} sliding carriers, expected "
+                 f"{expected} holding {group} layer-slot(s) of {n_sliding_slots}")
+    else:
+        n_full = len(tiles) if tiled else 1
+        need(len(states) == n_full + 1,
+             f"kv.states must declare one buffer per full-attention tile plus the sliding "
+             f"cache ({n_full + 1} with {n_full} tile(s)), got {len(states)}")
+        need(len(full_states) == n_full,
+             f"kv.states declares {len(full_states)} full-attention buffers, expected {n_full}")
+        need(len(sliding_states) == 1,
+             f"kv.states declares {len(sliding_states)} sliding buffers, expected 1")
     for state in states:
         need(bool(state.get("name")), "every kv state needs a name")
         need(isinstance(state.get("shape"), list) and state.get("shape"),
              f"kv state {state.get('name')} needs a shape")
     if isinstance(context, int) and full_states:
-        rows = 0
-        for state in full_states:
-            shape = state.get("shape") or []
-            if len(shape) == 4:
-                rows += int(shape[2])
-        need(rows == context,
-             f"the full-attention tiles hold {rows} rows in total, expected context_length "
-             f"{context}")
+        if split:
+            # every split state holds the whole context for one head group; the
+            # tiles, which are the case that sums to the context, cannot be on
+            wrong = [state.get("name") for state in full_states
+                     if len(state.get("shape") or []) != 4
+                     or int((state.get("shape") or [0, 0, 0, 0])[2]) != context]
+            need(not wrong,
+                 f"every split full-attention state must hold context_length {context} rows, "
+                 f"these do not: {wrong[:3]}")
+        else:
+            rows = 0
+            for state in full_states:
+                shape = state.get("shape") or []
+                if len(shape) == 4:
+                    rows += int(shape[2])
+            need(rows == context,
+                 f"the full-attention tiles hold {rows} rows in total, expected context_length "
+                 f"{context}")
     if tiled:
         need(len(tiles) > 1, "parameters.full_cache_tiled is true but full_cache_tiles "
                              "lists a single tile")
@@ -1378,9 +1426,8 @@ class DoryConverter(BaseConverter):
                       f"  blocks={spec.blocks}  lut={self.lut_bits.get(spec.lut_role)}"
                       f"  calls/token={spec.calls_per_token}")
             tiled, rope = tiling_flags(self.config)
-            print(f"  caches: {len(dch.state_attrs(self.config))} state(s), "
-                  f"tiles={list(dch.state_attrs(self.config)[:-1])}, "
-                  f"mask_len={int(self.config.mask_len)}")
+            print(f"  caches: {dch.state_summary(self.config)}")
+            print(f"  mask_len={int(self.config.mask_len)}")
             print(f"  tiled={tiled}  rope_tables_as_inputs={rope}")
         for spec, size in plan:
             check_size(spec.name, size)
@@ -1427,7 +1474,8 @@ def parse_tile_rows(value):
 
 
 def build_config(model_path, context_length=None, batch_size=None, config=None,
-                 full_tile_rows=None, rope_tables_as_inputs=False):
+                 full_tile_rows=None, rope_tables_as_inputs=False,
+                 heads_per_state=None, slots_per_sliding_carrier=None):
     """DoryANEConfig from the model directory's config.json, with overrides."""
     model_path = Path(model_path)
     config_json = model_path / "config.json"
@@ -1441,6 +1489,10 @@ def build_config(model_path, context_length=None, batch_size=None, config=None,
         overrides["full_cache_tiles"] = tiles
     if rope_tables_as_inputs:
         overrides["rope_tables_as_inputs"] = True
+    if heads_per_state is not None:
+        overrides["heads_per_state"] = int(heads_per_state)
+    if slots_per_sliding_carrier is not None:
+        overrides["slots_per_sliding_carrier"] = int(slots_per_sliding_carrier)
     if config is not None:
         return config
     if config_json.is_file():
@@ -1484,6 +1536,15 @@ def parse_args(argv=None):
     parser.add_argument("--rope-tables-as-inputs", action="store_true",
                         help="pass the RoPE cos/sin rows as graph inputs instead of tracing "
                              "them as constants (24K: the tables are ~100 MB of constants)")
+    parser.add_argument("--heads-per-state", type=int, default=None,
+                        help="split every KV cache into one state per group of this many "
+                             "key/value heads (DANE-5: 1 gives 36 full states of 24.0 MiB "
+                             "at 24,576 rows, under the measured 24 MiB per-state ceiling); "
+                             "unset keeps the aggregated caches")
+    parser.add_argument("--slots-per-sliding-carrier", type=int, default=None,
+                        help="how many sliding layer-slots share one state (default 3: "
+                             "9 carriers of 15.0 MiB at 24,576 rows, because the state "
+                             "COUNT has its own ceiling)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the plan and the size estimates, convert nothing")
     return parser.parse_args(argv)
@@ -1493,7 +1554,9 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     config = build_config(args.model, args.context_length, args.batch_size,
                           full_tile_rows=args.full_tile_rows,
-                          rope_tables_as_inputs=args.rope_tables_as_inputs)
+                          rope_tables_as_inputs=args.rope_tables_as_inputs,
+                          heads_per_state=args.heads_per_state,
+                          slots_per_sliding_carrier=args.slots_per_sliding_carrier)
     converter = DoryConverter(
         model_path=args.model, output_dir=args.output, config=config, prefix=args.prefix,
         lut_blocks=args.lut_blocks, lut_lm_head=args.lut_lm_head,

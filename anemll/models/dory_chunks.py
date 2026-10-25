@@ -180,18 +180,20 @@ def state_summary(config=None) -> str:
     the artifact rather than re-deriving them from shapes.
     """
     layout = state_layout(config)
-    mib = [(name, shape) for name, shape in layout]
     sizes = []
-    for _, shape in mib:
+    for _, shape in layout:
         elements = 1
         for dim in shape:
             elements *= int(dim)
         sizes.append(elements * 2 / 1024 ** 2)
     total = sum(sizes)
     largest = max(sizes) if sizes else 0.0
-    return ("%d states, %.1f MiB each for the largest group, %.1f MiB total, "
-            "max single state %.1f MiB (limit measured at 24 OK / 32 FAIL)"
-            % (len(layout), sizes[0] if sizes else 0.0, total, largest))
+    smallest = min(sizes) if sizes else 0.0
+    verdict = "OK" if largest <= 24.0 and len(layout) <= 56 else "OVER THE MEASURED LIMIT"
+    return ("%d states, %.1f-%.1f MiB each, %.1f MiB total, max single state "
+            "%.1f MiB / %d states (limits measured at 24 MiB / 56 states OK, "
+            "32 MiB / 63 states FAIL): %s"
+            % (len(layout), smallest, largest, total, largest, len(layout), verdict))
 
 
 def state_names(config=None, prefix: str = "model") -> tuple:
@@ -235,9 +237,15 @@ class _StateTouching(nn.Module):
     model: DoryANEModel
 
     def touch_states(self, out: torch.Tensor) -> torch.Tensor:
-        """Add 0 * every cache, so none is pruned as unused."""
-        dummy = self.model.kv_cache_sliding[0, 0, 0, 0] * 0.0
-        for cache in self.model.full_caches:
+        """Add 0 * every state, so none is pruned as unused.
+
+        The list comes from the model's own buffers rather than a hard-coded
+        pair: the split layout declares 45 of them, and one left out is a state
+        Core ML would drop from the union the runtime shares between components.
+        """
+        buffers = self.model.state_buffers
+        dummy = buffers[0][0, 0, 0, 0] * 0.0
+        for cache in buffers[1:]:
             dummy = dummy + cache[0, 0, 0, 0] * 0.0
         return out + dummy.view(1, 1, 1)
 

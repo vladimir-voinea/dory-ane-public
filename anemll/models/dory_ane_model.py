@@ -60,6 +60,76 @@ def _as_list(value):
     return [value]
 
 
+def _state_layout(config) -> tuple:
+    """The (name, shape) pairs of the state buffers, from dory_chunks.
+
+    dory_chunks imports this module at module scope, so the layout is fetched
+    lazily: it is only needed once a model is being built, long after both
+    modules are loaded, and there stays exactly one implementation of the layout
+    for the model, the converter and the runtime.
+    """
+    from anemll.models import dory_chunks
+
+    return tuple(dory_chunks.state_layout(config))
+
+
+def _own_caches(layer, full_table, sliding_table) -> tuple:
+    """(full cache, sliding cache) one layer owns, out of the per-slot tables.
+
+    An attention layer owns exactly one of the two and never touches the other;
+    an MLP layer owns neither.  The tables are built once per forward, so the
+    split layout still resolves its buffers through getattr on the model (which
+    is what a traced graph records) instead of copying them into a Python list.
+    """
+    if layer.is_mlp:
+        return None, None
+    if layer.is_full:
+        return full_table[layer.slot], None
+    return None, sliding_table[layer.slot]
+
+
+def _is_cache_port(value) -> bool:
+    """True for one (buffer, slot, num_slots): where a layer's K and V live."""
+    return (isinstance(value, (tuple, list)) and len(value) == 3
+            and torch.is_tensor(value[0]))
+
+
+def _cache_tiles(caches, slot: int, num_slots: int) -> list:
+    """Normalise what an attention layer was handed into [tile][buffer entry].
+
+    A buffer entry is (buffer, slot, num_slots) -- the aggregated buffer
+    interleaves its layer-slots as well, so one entry type serves both layouts.
+    Four call forms reach here and all four stay supported:
+
+      tensor                  one aggregated cache (the direct callers: the gate
+                              tests and the folding check address it this way)
+      [tensor, tensor]        one aggregated cache per full-attention tile
+      (buffer, slot, slots)   one split-layout buffer (a sliding carrier)
+      [[entry, entry, ...]]   the entries of one tile, one per KV-head group
+
+    The split form is what lets a layer read one head group at a time; keeping
+    the other three means the aggregated graph is fed exactly what it was before.
+    """
+    if torch.is_tensor(caches):
+        return [[(caches, slot, num_slots)]]
+    if _is_cache_port(caches):
+        return [[caches]]
+    tiles = list(caches)
+    if not tiles:
+        raise ValueError("attention needs at least one cache buffer")
+    if all(torch.is_tensor(tile) for tile in tiles):
+        return [[(tile, slot, num_slots)] for tile in tiles]
+    out = []
+    for tile in tiles:
+        entries = [tile] if _is_cache_port(tile) else list(tile)
+        for entry in entries:
+            if not _is_cache_port(entry):
+                raise ValueError(
+                    f"cache entry {entry!r} is not (buffer, slot, num_slots)")
+        out.append(entries)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -103,6 +173,16 @@ class DoryANEConfig:
         # risk, so the runtime can hand the rows in as inputs instead.  Off by
         # default: the 4096 graph stays exactly what DANE-5 builds.
         self.rope_tables_as_inputs = g("rope_tables_as_inputs", False)
+
+        # DANE-5: the per-(layer, head) cache layout.  None (the default) keeps the
+        # two aggregated buffers this model has always declared; a value splits
+        # every full-attention cache into one buffer per (layer-slot, head group),
+        # which is what fits under Core ML's measured per-state ceiling at 24,576
+        # rows (24 MiB loads, 32 MiB fails).  slots_per_sliding_carrier groups the
+        # windowed caches by layer-slot instead, because a 5 MiB carrier per slot
+        # would put the state COUNT over its own ceiling (56 loads, 63 fails).
+        self.heads_per_state = g("heads_per_state", g("cache_heads_per_state", None))
+        self.slots_per_sliding_carrier = g("slots_per_sliding_carrier", 3)
 
         self.state_length = g("state_length", self.context_length)
         self.batch_size = g("batch_size", 64)
@@ -317,6 +397,16 @@ class DoryANEAttention(nn.Module):
     (1, KV, K, D) cache.  The logits are viewed back as (B, H, Q, K) so the
     causal mask broadcasts without a copy, then reshaped again for the value
     matmul.  No repeat of K/V, and the cache is only read.
+
+    The state a layer reads is whatever its model hands it (see
+    DoryANEModel.cache_tables): the two aggregated buffers, one buffer per
+    full-attention tile, or -- the DANE-5 layout -- one buffer per (layer, head).
+    In that last form the loop below runs once per KV-head group and every
+    context-sized intermediate (the tile read, the scores, the softmax, the value
+    product) is one head's size.  The projections, RoPE and the norms stay whole-
+    tensor: their size is heads x q_len x head_dim, which the context length does
+    not touch, and keeping them where they were is what leaves the aggregated
+    path bit for bit identical.
     """
 
     def __init__(self, config: DoryANEConfig, block: int, fold_scales: bool):
@@ -384,9 +474,9 @@ class DoryANEAttention(nn.Module):
         bsz, q_len, _ = hidden_states.shape
         h, kv, d, rep = self.num_heads, self.num_kv_heads, self.head_dim, self.rep
         masks = _as_list(masks)
-        caches = _as_list(caches)
-        if len(masks) != len(caches):
-            raise ValueError(f"{len(masks)} masks for {len(caches)} caches")
+        tiles = _cache_tiles(caches, slot, num_slots)
+        if len(masks) != len(tiles):
+            raise ValueError(f"{len(masks)} masks for {len(tiles)} caches")
 
         conv_in = _to_conv_layout(hidden_states)
         q = _from_conv_layout(self.q_proj(conv_in))
@@ -412,41 +502,63 @@ class DoryANEAttention(nn.Module):
         q = self.q_norm(q) * self.sq.view(1, h, 1, d)               # L2 then sqk
         k = self.k_norm(k)
 
-        # -- write the current rows, then read the tiles back.
+        # -- write the current rows, then read the buffers back, then score.
+        # That order is not cosmetic: the sliding ring's cache_pos and the tiled
+        # write_index both describe a write that has to have happened before the
+        # read sees it, so a version that read first would pass a one-token test
+        # and be wrong from the second token on.
         # A full cache is addressed by absolute position; only a sliding cache
         # uses the ring offset.  (They coincide until context_length exceeds
         # sliding_rows, which is why a short-context test cannot see this.)
+        group = kv // len(tiles[0])
         if self.is_full:
-            self._write_full(caches, slot, num_slots, k, v, current_pos, q_len,
-                             write_indices, write_gates)
+            self._write_full(tiles, k, v, current_pos, q_len, write_indices, write_gates)
         else:
-            dc.write_cache_rows(caches[0], slot, k, v, cache_pos, num_slots)
+            for index, (cache, cslot, cnum) in enumerate(tiles[0]):
+                lo = index * group
+                dc.write_cache_rows(cache, cslot, k[:, lo:lo + group],
+                                    v[:, lo:lo + group], cache_pos, cnum)
 
-        # -- grouped-query attention by reshaping the queries per KV head
-        q_g = q.view(bsz, kv, rep, q_len, d).reshape(bsz, kv, rep * q_len, d)
-        if len(caches) == 1:
-            # The shipped single-cache path: exactly DANE-4's arithmetic, so the
-            # numbers the earlier tickets measured stay bit for bit what they were.
-            key_cache, value_cache = dc.read_cache_slot(caches[0], slot, num_slots,
-                                                        masks[0].shape[-1])
-            logits = torch.matmul(q_g, key_cache.transpose(-1, -2)) * self.scale
-            logits = logits.view(bsz, kv, rep, q_len, -1).reshape(bsz, h, q_len, -1)
-            logits = logits + masks[0]
-            probs = torch.softmax(logits, dim=-1)
-            probs = probs.view(bsz, kv, rep, q_len, -1).reshape(bsz, kv, rep * q_len, -1)
-            out4 = torch.matmul(probs, value_cache)                 # (B, KV, rep*Q, D)
-        else:
-            # The tiled fallback (spec D7): one partial per tile, combined with a
-            # log-sum-exp merge over the two disjoint key sets.
+        # -- grouped-query attention by reshaping the queries per KV head, then
+        # ONE KV-HEAD GROUP AT A TIME.  Each pass reads only its own buffer, so
+        # the tile it reads, its scores, its softmax and its value product are a
+        # single head's size at every step (12.6 MB for one head at 24,576 rows,
+        # against 50 MB for all four) -- and the buffers are never assembled back
+        # into one tensor, which would rebuild the 864 MiB intermediate the
+        # per-state ceiling rejects.  With a single group (the aggregated layout)
+        # these are the same operations on the same shapes as before; the head
+        # axis only decides how many passes run.
+        q_groups = q.view(bsz, kv, rep, q_len, d)
+        outs = []
+        for index in range(len(tiles[0])):
+            lo, hi = index * group, index * group + group
+            q_g = q_groups[:, lo:hi].reshape(bsz, group, rep * q_len, d)
             partials = []
-            for cache, mask in zip(caches, masks):
-                key_cache, value_cache = dc.read_cache_slot(cache, slot, num_slots,
+            for tile, mask in zip(tiles, masks):
+                cache, cslot, cnum = tile[index]
+                key_cache, value_cache = dc.read_cache_slot(cache, cslot, cnum,
                                                             mask.shape[-1])
                 logits = torch.matmul(q_g, key_cache.transpose(-1, -2)) * self.scale
-                logits = logits.view(bsz, kv, rep, q_len, -1).reshape(bsz, h, q_len, -1)
+                logits = logits.view(bsz, group, rep, q_len, -1).reshape(
+                    bsz, group * rep, q_len, -1)
                 logits = logits + mask
-                partials.append((logits.view(bsz, kv, rep * q_len, -1), value_cache))
-            out4, _ = dc.merge_attention_partials(partials)
+                partials.append((logits.view(bsz, group, rep * q_len, -1), value_cache))
+            if len(partials) == 1:
+                # The shipped single-cache path: exactly DANE-4's arithmetic, so
+                # the numbers the earlier tickets measured stay bit for bit what
+                # they were.
+                probs = torch.softmax(partials[0][0], dim=-1)
+                probs = probs.view(bsz, group, rep, q_len, -1).reshape(
+                    bsz, group, rep * q_len, -1)
+                outs.append(torch.matmul(probs, partials[0][1]))    # (B, G, rep*Q, D)
+            else:
+                # The tiled fallback (spec D7): one partial per tile, combined
+                # with a log-sum-exp merge over the two disjoint key sets.  The
+                # merge is per row, so merging one head group at a time is the
+                # same number as merging all of them together.
+                merged, _ = dc.merge_attention_partials(partials)
+                outs.append(merged)
+        out4 = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
 
         out = out4.view(bsz, kv, rep, q_len, d).reshape(bsz, h, q_len, d)
         out = out.transpose(1, 2).reshape(bsz, q_len, h * d)
@@ -454,8 +566,7 @@ class DoryANEAttention(nn.Module):
         out = self.out_norm(out * gate)                             # gate, then L2 over 4096
         return _from_conv_layout(self.o_proj(_to_conv_layout(out)))
 
-    def _write_full(self, caches, slot, num_slots, k, v, current_pos, q_len,
-                    write_indices, write_gates):
+    def _write_full(self, tiles, k, v, current_pos, q_len, write_indices, write_gates):
         """Write the current rows into the full cache -- one cache or two tiles.
 
         Traced (write_indices / write_gates given): every tile gets one lerp write
@@ -463,27 +574,40 @@ class DoryANEAttention(nn.Module):
         a gated-off tile rewrites its own rows unchanged, which is exact in FP16.
         Eager (no indices): the rows each tile owns are written directly, so a
         batch that straddles the tile boundary is exact there too.
+
+        Each entry of a tile is one buffer plus where that layer's K and V sit in
+        it, so the same write covers both layouts: the aggregated buffer
+        interleaves nine layer-slots (K at slot, V at slot + num_slots), while a
+        split one holds a single (layer, head) group at slot 0 with num_slots 1.
         """
+        heads = k.shape[1]
+        groups = heads // len(tiles[0])
+        spans = [(index * groups, index * groups + groups)
+                 for index in range(len(tiles[0]))]
         if write_indices is None:
-            if len(caches) == 1:
-                dc.write_cache_rows(caches[0], slot, k, v, current_pos, num_slots)
+            if len(tiles) == 1:
+                for (lo, hi), (cache, cslot, cnum) in zip(spans, tiles[0]):
+                    dc.write_cache_rows(cache, cslot, k[:, lo:hi], v[:, lo:hi],
+                                        current_pos, cnum)
                 return
             start = int(current_pos)
-            for (offset, rows), cache in zip(self.tile_geometry(), caches):
+            for (offset, rows), tile in zip(self.tile_geometry(), tiles):
                 lo, hi = max(start, offset), min(start + q_len, offset + rows)
                 if hi <= lo:
                     continue
-                dc.write_cache_rows(cache, slot,
-                                    k[:, :, lo - start:hi - start, :],
-                                    v[:, :, lo - start:hi - start, :],
-                                    lo - offset, num_slots)
+                for (klo, khi), (cache, cslot, cnum) in zip(spans, tile):
+                    dc.write_cache_rows(cache, cslot,
+                                        k[:, klo:khi, lo - start:hi - start, :],
+                                        v[:, klo:khi, lo - start:hi - start, :],
+                                        lo - offset, cnum)
             return
-        for index, gate, cache in zip(write_indices, write_gates, caches):
-            gate = gate.to(cache.dtype)
-            for row, new in ((slot, k), (slot + num_slots, v)):
-                current = cache[row:row + 1, :, index:index + q_len, :]
-                updated = current + (new.to(cache.dtype) - current) * gate
-                cache[row:row + 1, :, index:index + q_len, :] = updated
+        for index, gate, tile in zip(write_indices, write_gates, tiles):
+            for (lo, hi), (cache, cslot, cnum) in zip(spans, tile):
+                gate = gate.to(cache.dtype)
+                for row, new in ((cslot, k[:, lo:hi]), (cslot + cnum, v[:, lo:hi])):
+                    current = cache[row:row + 1, :, index:index + q_len, :]
+                    updated = current + (new.to(cache.dtype) - current) * gate
+                    cache[row:row + 1, :, index:index + q_len, :] = updated
 
 
 class DoryANEMLP(nn.Module):
@@ -594,33 +718,108 @@ class DoryANEModel(nn.Module):
                 layer.slot = sliding_slots[layer.block]
                 layer.num_slots = len(sliding_slots)
 
-        tiles = config.full_tiles
-        self._full_cache_names = []
-        for index, shape in enumerate(dc.full_cache_shapes(
-                config.context_length, config.num_key_value_heads, config.head_dim,
-                tiles, num_slots=len(full_slots)), start=1):
-            name = "kv_cache_full" if len(tiles) == 1 else f"kv_cache_full_{index}"
-            self.register_buffer(name, torch.zeros(shape, dtype=config.dtype),
-                                 persistent=False)
-            self._full_cache_names.append(name)
-        _, sliding_shape = dc.cache_shapes(
-            config.context_length, config.num_key_value_heads, config.head_dim,
-            config.sliding_window, config.batch_size)
-        self.register_buffer("kv_cache_sliding", torch.zeros(sliding_shape, dtype=config.dtype),
-                             persistent=False)
+        # DANE-5: the buffers come from dory_chunks.state_layout, the one place
+        # that decides how the caches are carved up -- the converter declares its
+        # states from it and the runtime builds its single MLState from the same
+        # list.  Default (no head split, no tiles): the two buffers this class
+        # has always registered, byte for byte.
+        layout = _state_layout(config)
+        self.state_buffer_names = tuple(name for name, _ in layout)
+        for name, shape in layout:
+            self.register_buffer(name, torch.zeros(tuple(int(d) for d in shape),
+                                                   dtype=config.dtype), persistent=False)
+        self._full_cache_names = tuple(name for name in self.state_buffer_names
+                                       if name.startswith("kv_cache_full"))
+        self._sliding_cache_names = tuple(name for name in self.state_buffer_names
+                                          if name.startswith("kv_cache_sliding"))
+        self.split_cache = config.heads_per_state is not None
+        if self.split_cache:
+            self._split_full_names = self._split_full_groups(len(full_slots))
+            self._split_sliding_slots = self._split_sliding_groups(len(sliding_slots))
         self.l2 = DoryL2Norm(config.hidden_size, config.l2_eps)
 
     @property
     def full_caches(self) -> list:
-        """The full-attention cache buffers: one, or the spec's two tiles."""
+        """The full-attention cache buffers: one, or the spec's two tiles.
+
+        In the split layout there is no tile list -- the buffers are per
+        (layer, head) and cache_tables() hands each layer the ones it owns.
+        """
         return [getattr(self, name) for name in self._full_cache_names]
 
+    @property
+    def state_buffers(self) -> list:
+        """Every state buffer, in declaration order (dory_chunks.state_layout)."""
+        return [getattr(self, name) for name in self.state_buffer_names]
+
+    def cache_tables(self):
+        """What each attention layer reads and writes, indexed by its slot.
+
+        full[slot] goes to a full-attention layer as its caches, sliding[slot] to
+        a sliding one.  Aggregated (the default) every slot shares the objects
+        this model always passed -- the tile list and the single sliding buffer,
+        all KV heads inside them -- so the shipped graph is untouched.  Split,
+        each slot owns its buffers: one entry per KV-head group for the full
+        attention (a 24.0 MiB state carries one head's K and V at 24,576 rows),
+        and one carrier that holds the layer-slot for the windowed ones.
+        """
+        if not self.split_cache:
+            full_slots, sliding_slots = dc.cache_slots()
+            return ([self.full_caches] * len(full_slots),
+                    [self.kv_cache_sliding] * len(sliding_slots))
+        full = [[[(getattr(self, name), 0, 1) for name in names]]
+                for names in self._split_full_names]
+        sliding = [(getattr(self, name), local, count)
+                   for name, local, count in self._split_sliding_slots]
+        return full, sliding
+
+    def _split_full_groups(self, count: int) -> list:
+        """[slot] -> the state buffers that slot's K and V live in, in head order.
+
+        Read off the registered names (kv_cache_full_<slot>_<head>, from
+        dory_chunks.state_layout) rather than re-derived from the knobs, so a
+        layout that ever renames or reorders them fails here instead of quietly
+        writing one head's rows into another head's buffer.
+        """
+        groups = {slot: [] for slot in range(count)}
+        for name in self._full_cache_names:
+            parts = name.split("_")
+            if len(parts) != 5 or parts[:3] != ["kv", "cache", "full"]:
+                raise ValueError(f"unexpected full-cache state name {name!r}")
+            slot, head = int(parts[3]), int(parts[4])
+            if slot not in groups:
+                raise ValueError(f"state {name} names slot {slot}, which no block uses")
+            groups[slot].append((head, name))
+        out = []
+        for slot in range(count):
+            if not groups[slot]:
+                raise ValueError(f"the split layout declares no state for full slot {slot}")
+            out.append(tuple(name for _, name in sorted(groups[slot])))
+        return out
+
+    def _split_sliding_groups(self, count: int) -> list:
+        """[slot] -> (buffer name, index of the slot inside it, slots in it)."""
+        carriers = []
+        for name in self._sliding_cache_names:
+            parts = name.split("_")
+            if len(parts) != 5 or parts[:3] != ["kv", "cache", "sliding"]:
+                raise ValueError(f"unexpected sliding-cache state name {name!r}")
+            carriers.append((int(parts[3]), int(parts[4]), name))
+        out = [None] * count
+        for first, last, name in sorted(carriers):
+            for slot in range(first, last + 1):
+                if not 0 <= slot < len(out) or out[slot] is not None:
+                    raise ValueError(f"sliding state {name} does not line up with the slots")
+                out[slot] = (name, slot - first, last - first + 1)
+        if any(item is None for item in out):
+            raise ValueError("the split layout leaves a sliding slot without a state")
+        return out
+
     def reset_caches(self) -> None:
-        dc.reset_caches(*self.full_caches, self.kv_cache_sliding)
+        dc.reset_caches(*self.state_buffers)
 
     def cache_bytes(self) -> int:
-        buffers = self.full_caches + [self.kv_cache_sliding]
-        return sum(b.numel() * b.element_size() for b in buffers)
+        return sum(b.numel() * b.element_size() for b in self.state_buffers)
 
     def split_mask(self, causal_mask):
         """The whole-context mask as (one slice per full tile, the sliding mask).
@@ -638,10 +837,11 @@ class DoryANEModel(nn.Module):
 
     def process_blocks(self, hidden_states, causal_mask, current_pos, cache_pos):
         masks_full, mask_sliding = self.split_mask(causal_mask)
-        caches = self.full_caches
+        full_table, sliding_table = self.cache_tables()
         h = hidden_states
         for layer in self.layers:
-            h = layer(h, masks_full, mask_sliding, caches, self.kv_cache_sliding,
+            h = layer(h, masks_full, mask_sliding,
+                      *_own_caches(layer, full_table, sliding_table),
                       current_pos, cache_pos)
         return h
 
@@ -681,7 +881,6 @@ class DoryANEChunk(nn.Module):
         """
         model = self.model
         masks_full, mask_sliding = model.split_mask(causal_mask)
-        caches = model.full_caches
         write_indices = None
         write_gates = None
         if write_index_1 is not None:
@@ -708,10 +907,13 @@ class DoryANEChunk(nn.Module):
             if h_in is None:
                 raise ValueError("the recurrent chunk needs h_in (the loop entry state)")
             h = model.l2(h + h_in)
+        full_table, sliding_table = model.cache_tables()
         for i in self._indices:
-            h = model.layers[i](h, masks_full, mask_sliding, caches, model.kv_cache_sliding,
-                                current_pos, cache_pos, write_indices, write_gates,
-                                rope_sliding, rope_full)
+            layer = model.layers[i]
+            h = layer(h, masks_full, mask_sliding,
+                      *_own_caches(layer, full_table, sliding_table),
+                      current_pos, cache_pos, write_indices, write_gates,
+                      rope_sliding, rope_full)
         if self.loop_exit:
             h = model.l2(h)
         return h
